@@ -1,0 +1,46 @@
+# cscope, tags, other
+TAGS
+cscope.*
+ID
+
+# Contents Directories to ignore
+.deps/
+obj/
+# Some build outputs and temporal files
+obj/*
+*.o
+*.gcno
+*.gcda
+*.gcov
+*.ncb
+*.lo
+*.loT
+*.la
+*.exe
+*.html
+*.pdf
+*.ps
+*.d
+.depend
+
+*~
+.*~
+.libs
+
+ /test
+## Test binaries and logs are ignored
+test/test*
+test/test*.log
+test/test*.trs
+## Test source files must be tracked
+!test/test*.[ch]
+!test/test*.[ch]pp
+## Build script and documentations must be tracked
+!test/CMakeLists.txt
+!test/README.md
+!test/Readme.md
+!test/readme.md
+!test/Makefile
+!test/Readme.txt
+!test/README.txt
+!test/readme.txt
