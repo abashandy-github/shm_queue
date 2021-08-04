@@ -17,7 +17,16 @@
  * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, 
  * NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN      
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. 
+
+ ** NOTE: BUG
+ * There is a bug in this experimental code. If the size of the packet exceeds
+ * 1024 OR the number of packets in the queue exceeds 256, the receiver starts
+ * seeing obj->counter becoming zero and some pther memory corruption things
+ * I never had time to fix this problem
+ * Anyway, this is EXPERIMENTAL code. So bugs are not uncommon
  *
+ * What is this
+ * ============
  * Point to multipoint shared memory queue comparison with 2 other IPC
  * mechanisms 
  * - AF_UNIX socket
@@ -271,13 +280,14 @@
 #define DEFAULT_BATCH_SIZE (32)/* # packets to write or read before sender writes
                                   to or receiver waits on eventfd, respectively */
 #define DEFAULT_QUEUE_LOW_WATER (DEFAULT_QUEUE_LEN >> 1) /* 1/2 the queue */
+#define DEFAULT_SLOW_FACTOR (0) /* Looping to slow sender or receiver down */
 
 /* Max values */
-#define MAX_PACKET_SIZE  (8192)
+#define MAX_PACKET_SIZE  (1024) /* Limited to 1024 because of some bug */
 #define MAX_NUM_OBJS (1 << 31) /* 2 Billion objects to transmit */
-#define MAX_QUEUE_LEN (2048)
+#define MAX_QUEUE_LEN (256) /* Limited to 256 because of a bug */
 #define MAX_QUEUE_NAME_LEN 256
-#define MAX_BATCH_SIZE (MAX_QUEUE_LEN >> 2) /* (1/4 max queue len)*/
+#define MAX_BATCH_SIZE (MAX_QUEUE_LEN) /* a single batch can be the entire queue*/
 
 /*
  * Default named socket (AF_UNIX) path
@@ -288,7 +298,6 @@
  * max and default values for the transmitter-receiver communciation
  */
 #define MAX_NUM_RECEIVERS (4)
-#define DEFAULT_NUM_RECEIVERS (1)
 
 
 /*
@@ -315,7 +324,10 @@ typedef struct packet_t_ {
 typedef struct shm_queue_t_ {
   bool high_water_mark_reached;
   uint32_t obj_size;
+  bool receiver_waiting_for_pulse_from_sender; /* true when receiver is waiting
+                                                  for sender to wake it up*/
   uint32_t queue_len; /* total Number of packets in the queue */
+  uint32_t window_size; /* total Number of byte of the shared mem window */
   uint32_t head; /* where receiver dequeues packets */
   uint32_t tail; /* where sender enqueues packets */
   uint32_t packet_size; /* packet size */
@@ -384,6 +396,16 @@ static uint32_t num_receivers = DEFAULT_NUM_RECEIVERS;
 static int eventfd_flags = EFD_NONBLOCK | EFD_SEMAPHORE;
 
 
+/*
+ * IN general, after each batch we will pulse ouirselves if there are still
+ * packets in the queu (for receiver) 
+ * this way we defer receiving to emulate a thread that has to
+ * service other tasks instead of dwqeueing packets
+ * However if the user wants us to only service packets, then the variable has
+ * to be false
+ */
+bool receiver_defer_after_each_batch = false;
+
 /* Variables for the window */
 static uint32_t queue_len = DEFAULT_QUEUE_LEN;
 /* If the sender blocks because there are no empty packets in the queue, then
@@ -449,6 +471,12 @@ uint32_t num_pulse_myself = 0; /* # times receiver had to pulse itself because
 /* Number of times recevier saw the high water mark flag set then the size of
    the queue goes below the low water mark*/
 uint32_t num_low_water_mark_reached = 0;
+
+
+/*
+ * slow factor
+ */
+uint32_t slow_factor = DEFAULT_SLOW_FACTOR;
 
 
 
@@ -686,7 +714,8 @@ static void print_stats(void)
   PRINT_INFO("\n%s Statistics:\n"
              "\tTotal Time: %lu.%lu\n"
              "\tnum_batchs = %u\n"
-             "\t%sbatch_size = %u\n"
+             "\tMax batch_size = %u\n"
+             "\tMax batch_size in bytes = %u\n"
              "\tnum_packets = %u\n"
              "\tPacket size = %u\n"
              "\tobjs/packet = %u\n"
@@ -697,12 +726,13 @@ static void print_stats(void)
              "\tnum_lost_objs = %u\n"
              "\tnum_pulse_myself  = %u\n"
              "\tnum_low_water_mark_reached=%u\n"
+             "\tSlow factor = %u\n"
              "\tqueue = (%s)\n",
              is_transmitter ? "Sender" : "Receiver",
              time_diff.tv_sec, time_diff.tv_usec,
              num_batchs,
-             is_transmitter ? "Max" : "Max ",
              batch_size,
+             batch_size * queue->packet_size ,
              num_packets,
              queue->packet_size,
              queue->packet_size/queue->obj_size,
@@ -713,9 +743,33 @@ static void print_stats(void)
              num_lost_objs,
              num_pulse_myself,
              num_low_water_mark_reached,
+             slow_factor,
              print_queue(queue));
 }
 
+
+
+static bool
+is_power_of_two(uint32_t num)
+{
+  uint32_t num_ones = 0, i;
+
+  if (num & 0x1) {
+    return (false);
+  }
+  /* We treat zero as NOT power of two? */
+  if (!num) {
+    return (false);
+  }
+
+  for (i = 0; i < sizeof(num) << 3; i++) {
+    num = num >> 1; /* Shift right */
+    num_ones += (num & 0x1);
+  }
+  return  (!(num_ones > 1));
+}
+
+  
 /* CTRL^C handler */
 static void
 signal_handler(int s __attribute__ ((unused))) 
@@ -993,8 +1047,10 @@ print_usage (const char *progname)
   fprintf (stdout,
            "usage: %s [options] \n"
            "\t-a Use Adaptive Mutex (non-portable)\n"
+           "\t-d receiver defer dequeing after each batch by pulsing ourselves (default '%s')\n"
            "\t-t Transmitter mode instead of the default receiver mode\n"
-           "\t-s <sockpath>: user another socket path instead of default'%s'\n"
+           "\t-s <slow_factor> default %u\n"
+           "\t-S <sockpath>: user another socket path instead of default '%s'\n"
            "\t-p <packetsize>: user another packet size default %u\n" 
            "\t-r <num_receivers>: Specify number of receivers instead of default %u\n"
            "\t-n <num_objs> # of objects to send/receive. Default %u\n"
@@ -1004,6 +1060,8 @@ print_usage (const char *progname)
            "\t-b <batch size>, default %u\n"
            "\t-o <object size>, default %u\n",
            progname,
+           receiver_defer_after_each_batch ? "true" : "false",
+           DEFAULT_SLOW_FACTOR,
            DEFAULT_SOCK_PATH,
            DEFAULT_PACKET_SIZE,
            DEFAULT_NUM_RECEIVERS,
@@ -1042,16 +1100,25 @@ main (int    argc,
   memset(queue_name, 0, sizeof(queue_name));
   strcpy(queue_name, DEFAULT_QUEUE_NAME);
   
-  while ((opt = getopt (argc, argv, "aetp:r:n:q:b:o:l:s:")) != -1) {
+  while ((opt = getopt (argc, argv, "aetdp:r:n:q:b:o:l:S:s:")) != -1) {
     switch (opt)
       {
       case 'a':
         is_adaptive_mutex = true;
         break;
+      case 'd':
+        receiver_defer_after_each_batch = false;
+        break;
       case 't':
         is_transmitter = true;
         break;
       case 's':
+        if (1 != sscanf(optarg, "%u", (uint32_t *)(&slow_factor))) {
+          PRINT_ERR("\nCannot read Slow factor %s. \n", optarg);
+          exit (EXIT_FAILURE);
+        }
+        break;
+      case 'S':
         sock_path = optarg;
         if (strlen(sock_path) >= UNIX_PATH_MAX) {
           PRINT_ERR("\nSocket path '%s' len = %u. MUST be less than %u\n",
@@ -1076,7 +1143,7 @@ main (int    argc,
           PRINT_ERR("\nCannot read number of objects %s. \n", optarg);
           exit (EXIT_FAILURE);
         }
-        if (num_objs >= (uint32_t)MAX_NUM_OBJS || !num_objs) {
+        if (num_objs > (uint32_t)MAX_NUM_OBJS || !num_objs) {
           PRINT_ERR("\nInvalid number of objects %s. "
                     "Must be between 1 and %u\n", optarg, MAX_NUM_OBJS);
           exit (EXIT_FAILURE);
@@ -1087,7 +1154,7 @@ main (int    argc,
           PRINT_ERR("\nCannot read number of receivers %s. \n", optarg);
           exit (EXIT_FAILURE);
         }
-        if (num_receivers >= MAX_NUM_RECEIVERS || !num_receivers) {
+        if (num_receivers > MAX_NUM_RECEIVERS || !num_receivers) {
           PRINT_ERR("\nInvalid number of receivers %s. "
                     "Must be between 1 and %u\n", optarg, MAX_NUM_RECEIVERS);
           exit (EXIT_FAILURE);
@@ -1098,8 +1165,8 @@ main (int    argc,
           PRINT_ERR("\nCannot read queue length %s. \n", optarg);
           exit (EXIT_FAILURE);
         }
-        if (queue_len >= MAX_QUEUE_LEN || !queue_len) {
-          PRINT_ERR("\nInvalid number of receivers %s. "
+        if (queue_len > MAX_QUEUE_LEN || !queue_len) {
+          PRINT_ERR("\nInvalid queue len %s. "
                     "Must be between 1 and %u\n", optarg, MAX_QUEUE_LEN);
           exit (EXIT_FAILURE);
         }
@@ -1143,7 +1210,7 @@ main (int    argc,
         }
         if (batch_size < 1 || batch_size > MAX_BATCH_SIZE) {
           PRINT_ERR("\nInvalid batch_size %s. "
-                    "Must be between 0 and %u\n", optarg, MAX_BATCH_SIZE);
+                    "Must be between 1 and %u\n", optarg, MAX_BATCH_SIZE);
           exit (EXIT_FAILURE);
         }
         break;
@@ -1172,14 +1239,20 @@ main (int    argc,
   }
 
 
+  if (!is_power_of_two(queue_len)) {
+    PRINT_ERR("queue len is '%u' MUST be a power of two.\n",
+              queue_len);
+    exit (EXIT_FAILURE);
+  }
+  
   if (batch_size > queue_len) {
     PRINT_ERR("\nBatch size %u cannot exceed total queue length %u\n",
               batch_size, queue_len);
     exit (EXIT_FAILURE);
   }
 
-  if (low_water_mark > queue_len/2 || !low_water_mark) {
-    PRINT_ERR("\nLow water marke %u cannot exceed HALF total queue length %u\n",
+  if (low_water_mark > queue_len-1 || !low_water_mark) {
+    PRINT_ERR("\nLow water mark %u MUST be strictly less than total queue length %u\n",
               low_water_mark, queue_len/2);
     exit (EXIT_FAILURE);
   }
@@ -1265,6 +1338,7 @@ main (int    argc,
     queue->queue_len = queue_len;
     queue->packet_size = packet_size;
     queue->obj_size = obj_size;
+    queue->window_size = window_size;
     
     /*
      * Init the mutex
@@ -1326,6 +1400,7 @@ main (int    argc,
     queue_len = queue->queue_len;
     packet_size = queue->packet_size;
     obj_size = queue->obj_size;
+    window_size = queue->window_size;
   }
   
   /* Number of objects to pack/unpack into/from a packet */
@@ -1334,31 +1409,39 @@ main (int    argc,
 
   /* Print the shared memory queue parameters */
   PRINT_INFO("\n%s Shared memory queue:\n"
-              "Name:                                   %s\n"
-              "Queue Len:                              %u\n"
-              "Low water Mark:                         %u\n"
-              "Adaptive mutex                          %s\n"
-              "Single packet size:                     %u\n"
-              "Single payload size:                    %lu\n"
-              "Object size:                            %u\n"
-              "Objects per packet:                     %u\n"
-              "Max single Batch Size:                  %u\n"
-              "Total number of objects to %s     %u\n"
-              "Total queue size in bytes:              %u\n"
-             "Total packet buffer in bytes:           %lu\n",
+              "Name:                                         %s\n"
+              "Queue Len:                                    %u\n"
+              "Low water Mark:                               %u\n"
+              "Adaptive mutex                                %s\n"
+              "Single packet size:                           %u\n"
+              "Single payload size:                          %lu\n"
+              "Object size:                                  %u\n"
+              "Objects per packet:                           %u\n"
+              "Max single Batch Size (in packets):           %u\n"
+              "Max batch size (in bytes):                    %u\n"
+              "Number of objects in a max batch:             %u\n"
+              "Total payload size in a max batch in bytes:   %u\n"
+              "Total number of objects to %s           %u\n"
+              "Total queue size in bytes:                    %u\n"
+              "Total packet buffer in bytes:                 %lu\n"
+              "Slow factor                                   %u\n",
               is_transmitter ? "Transmitter" : "Receiver",
               queue_name,
               queue->queue_len,
               low_water_mark,
               is_adaptive_mutex ? "true" : "false",
               queue->packet_size,
-             queue->packet_size - offsetof(packet_t, data),
+              queue->packet_size - offsetof(packet_t, data),
               obj_size,
               objs_per_packet,
               batch_size,
-              is_transmitter ? "send:   " : "receive:", num_objs,
+              batch_size * queue->packet_size,
+             batch_size * objs_per_packet,
+              batch_size * objs_per_packet * queue->obj_size,
+             is_transmitter ? "send:   " : "receive:", num_objs,
              window_size,
-             window_size - offsetof(shm_queue_t, packets));
+             window_size - offsetof(shm_queue_t, packets),
+             slow_factor);
   
   
   
@@ -1492,6 +1575,7 @@ main (int    argc,
         exit(EXIT_FAILURE);
       }
     }
+    PRINT_INFO("Connected to %u receivers..\n\n",num_receivers);
     
     /*
      * prepare the epoll for sender so that we can wait on it if we find that
@@ -1692,7 +1776,7 @@ main (int    argc,
        * - We will pulse the receiver
        * - we will wait for the receiver(s) pulse
        * 
-       * NOTE: Why we MUST pulse the receiver when we wait for receiver's puse?
+       * NOTE: Why we MUST pulse the receiver when we wait for receiver's pulse?
        * Consider the following scenario that would lead to a deadlock
        * - The receiver drained all packets in the queue hence it will be
        *   waiting for the sender's pulse
@@ -1705,13 +1789,13 @@ main (int    argc,
        *            the queue mutex
        *            Instead it waits till it finished the current batch or
        *            fills up the queue
-       * - Even though the receiver locks he mutex when it checksx whether the
+       * - Even though the receiver locks the mutex when it checks whether the
        *   sender reached the high water mark, because the sender updates the
        *   queue after it finishes queueing, it is possible that the receiver
-       *   seees that thew sender did NOT reach the high water mark even though
+       *   sees that thew sender did NOT reach the high water mark even though
        *   the sender has actually reached the high water mark
        * - Hence by the time the sender locks the mutex and decides that it has
-       *   reached the high water mark, the sender whould have thought that the
+       *   reached the high water mark, the sender would have thought that the
        *   queue is empty and will be waiting for a pulse from the sender
        * - At the same time the sender would be waiting for a pulse from the
        *   receiver
@@ -1736,6 +1820,16 @@ main (int    argc,
       
       if (queue->queue_len == queue->num_queued_packets) {
         queue->high_water_mark_reached = true;
+        /* As mentiokned above, we will wakeup receiver to avoid possible
+           deadlock */
+        if (queue->receiver_waiting_for_pulse_from_sender) {
+          is_pulse_receiver = true;
+          /* Clear the need for pulse receiver because we will send it within
+             the next few instructions */
+          queue->receiver_waiting_for_pulse_from_sender = false;
+        }
+        /* Inc number of times sender will block until receiver drains queue
+           because of re3aching high water mark*/
         num_sender_wakeup_needed++;
         QUEUE_UNLOCK;
         PRINT_DEBUG("Going to wait on sender_wakeup fd %d,\n "
@@ -1749,9 +1843,11 @@ main (int    argc,
                     num_batchs,
                     curr_batch_size,
                     print_queue(queue));
-        /* As mentiokned above, we will wakeup receiver to avoid possible
-           deadlock */
-        PULSE_RECEIVER(num_receivers);
+        if(is_pulse_receiver) {
+           is_pulse_receiver = false; /* NO need anymore because I just
+                                        pulsed receiver*/
+           PULSE_RECEIVER(num_receivers);
+        }
         /* wait */
         rc = epoll_wait(epoll_fd, &event, 1, -1);
         if (rc < 0) {
@@ -1783,10 +1879,19 @@ main (int    argc,
                     curr_batch_size,
                     print_queue(queue));
       }
-      /* Pulse the receiver if queue was empty when we started this batch */
+      /* Pulse the receiver if queue was empty when we started this batch OR
+         we have reached the high water mark AND the receiver said it will
+         wait on epoll_wait() for a pulse from the sender */
       if (is_pulse_receiver) {
         PULSE_RECEIVER(num_receivers);
-      }      
+      }
+      /* Slow ourselves if we requested */
+      for (i = 0; i < slow_factor; i++) {
+        static uint32_t __attribute__ ((unused)) a;
+        uint32_t b = 5000, c = 129;
+        a = b * c;
+      }
+      
     }
     /* get time stamp when finish sending */
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
@@ -1809,6 +1914,9 @@ main (int    argc,
     uint32_t num_epoll_wait = 0; /* Number of times we waited in epoll_wait */
     PRINT_DEBUG("Going to call epoll_wait() on epoll_fd=%d for evenfd %d. \n",
                 epoll_fd, receiver_wakeup_eventfd_fd);
+    QUEUE_LOCK;
+    queue->receiver_waiting_for_pulse_from_sender = true;
+    QUEUE_UNLOCK;    
     while((rc = epoll_wait(epoll_fd, &event, 1, -1)) > 0) {
       num_epoll_wait++;
 
@@ -1829,7 +1937,10 @@ main (int    argc,
        * have read to decrement, otherrrwise we will continue to be waken up */
       uint64_t eventfd_read;
       read(receiver_wakeup_eventfd_fd, &eventfd_read, sizeof( eventfd_read));
- 
+
+      /* User have to option to continue instead of pulsing ourself */
+    begin_receive_loop:
+      
       QUEUE_LOCK;
       /*
        * Adjust the batch size according to the currently queued packets
@@ -1930,7 +2041,7 @@ main (int    argc,
           num_sent_received_objs++; /* inc number of unpacked objects */
         }
         num_packets++; /* Inc number of packed packets */
-        sequence++;
+        sequence++; /* Inc expected packet sequence number */
       }
       /* Inc number of queued batchs */
       num_batchs = curr_batch_size ? num_batchs + 1 : num_batchs; 
@@ -1939,7 +2050,7 @@ main (int    argc,
       QUEUE_LOCK;
       /* Update the queue after dequeueing an entire batch */
       QUEUE_HEAD_INC(curr_batch_size);
-          PRINT_DEBUG("***ADVANCED HEAD by curr_batch %u object counter %u %uth packet sequence %u tail %u, "
+      PRINT_DEBUG("***ADVANCED HEAD by curr_batch %u object counter %u %uth packet sequence %u tail %u, "
                       "from data %p packet %p\n"
                       "\tSo far sender_wakeup_needed %u lost objects %u.\n"
                       "\tSo sent %d objects %u packets %u batchs\n"
@@ -1956,7 +2067,14 @@ main (int    argc,
        * If there are still some packets in the queue, then we need to pulse
        * ourselves so that we wakeup and continue receiving the data
        */
-      pulse_myself = queue->num_queued_packets;
+      pulse_myself = !!(queue->num_queued_packets);
+
+      /*
+       * If I am NOT going to pulse myself then I will need a wakeup pulse from
+       * the sender
+       */
+      queue->receiver_waiting_for_pulse_from_sender = !pulse_myself;
+      num_receiver_wakeup_needed += queue->receiver_waiting_for_pulse_from_sender;
 
       /*
        * If, before, while, or after we draining this batch, sender exceeded
@@ -1993,10 +2111,10 @@ main (int    argc,
          */
         if (queue->num_queued_packets < low_water_mark) {
           num_low_water_mark_reached++;
-          /* Unlock AFTER we check if we went below the low water mark */
-          QUEUE_UNLOCK;
           /* no longer in high water mark state*/
           queue->high_water_mark_reached = false;
+          /* Unlock AFTER we check if we went below the low water mark */
+          QUEUE_UNLOCK;
           /* Wakeup the sender, which is waiting until queue is below water mark*/
           PULSE_SENDER;
         } else {
@@ -2004,12 +2122,30 @@ main (int    argc,
           QUEUE_UNLOCK;
         } 
       } else {
+        /* Sender did not go into high water mark node. Just unlock queue */
         QUEUE_UNLOCK;
+      }
+      
+      /* Slow down if required 
+       We want to do that BEFORE checking if we have to pulse ourselves
+       because if we do NOT have to pulse ourselves we go back to the
+       beginning of the loop to read the next bactc immediately*/
+      for (i = 0; i < slow_factor; i++) {
+        static uint32_t __attribute__ ((unused)) a;
+        uint32_t b = 5000, c = 129;
+        a = b * c;
       }
 
       /* If we have to pulse ourself, let's do that  */
       if (pulse_myself) {
-        PULSE_RECEIVER(1); /* Just orselves, so it is "1" */
+        /* If the user requested that if there are still some packets in the
+           queue  we continuue dequeue immediately instead of 
+           deferring the dequeue after each batch, let's do that */
+        if (receiver_defer_after_each_batch) {
+          PULSE_RECEIVER(1); /* Just ourselves, so it is "1" */
+        } else {
+          goto begin_receive_loop;
+        }
       } else {
         if (sender_exited) {
           /* 
@@ -2064,7 +2200,7 @@ main (int    argc,
   timersub(&end_tv, &start_tv, &time_diff);
 
 
-  PRINT_INFO( "Going sleep 2 seconds then unlink '%s'\n"
+  /* PRINT_INFO( "Going sleep 2 seconds then unlink '%s'\n"
               "\tTransmitter socket %d\n"
               "\tNumber of Receivers  %d\n"
               "\tqueue=(%s)\n\n",
@@ -2073,8 +2209,8 @@ main (int    argc,
               num_receivers,
               print_queue(queue));
   
-  /* Sleep 2 seconds to make sure that receiver drains all packets BEFORE
-   * etting a HUP event from the epoll_wait() */
+   Sleep 2 seconds to make sure that receiver drains all packets BEFORE
+   * Getting a HUP event from the epoll_wait() */
   /*if (is_transmitter) {
     sleep(2);
     }*/
