@@ -59,9 +59,9 @@
  * How to build
  * ============
  * Use
- *    gcc -o shm_simple_queue_eventfd shm_simple_queue_eventfd.c shm_common.c -lrt -pthread -Wall -Wextra
+ *    gcc -o shm_simple_queue shm_simple_queue.c shm_common.c -lrt -pthread -Wall -Wextra
  * OR (if you want symbols)
- *   gcc -g -O0 -o shm_simple_queue_eventfd shm_simple_queue_eventfd.c shm_common.c -lrt -pthread -Wall -Wextra
+ *   gcc -g -O0 -o shm_simple_queue shm_simple_queue.c shm_common.c -lrt -pthread -Wall -Wextra
  *
  * - to log a message for each sent and received packet, use -DLOG_PER_PACKET
  *      gcc -DLOG_PER_PACKET -o shm_simple_queue shm_simple_queue.c shm_common.c -lrt -pthread -Wall -Wextra
@@ -70,18 +70,14 @@
  *
  * How to use
  * ============
- * ------------
  * - In one window start the sehnder using "-t" option. You can change default
  *   arguments. For example
  *     ./shm_simple_queue  -t -n 1000000000 -b 2000 -o 50
- *   This will send 1 billion objects, each of size 50, in a batch of 2000
- *   objects each. 
- *   Hence we will create a single packet shared memory window each of size
- *   2000x50 = 10,000 bytes plus the sizeof(packet_t), which is 16. So the
- *   total shared memory window size will be 10,016 bytes
- *
  * - In another window, start the receiver using  
  *       ./shm_simple_queue -o 50
+ *
+ * - If you want to use AF_UNIX instead of eventfd for signaling, add the
+ *    option "-u" to the command line on both sender and receiver
  *
  * This will cause the sender to send 1 billion objects, each of size 50, in
  * a batch of 2000 objects each.  
