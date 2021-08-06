@@ -20,7 +20,7 @@
 
  * 
  * the objective is to measure how much time to send a certain number of equal
- * size objects accross a TCP
+ * size objects across a TCP
  * To make the emulation more realistic, the receiver uses a non-blocking
  * sockets and waits on epoll_wait() for packets to arrive from the sender
  * This is because we assume thast most application will have the thread
@@ -120,7 +120,7 @@
 #define MIN_OBJ_SIZE (sizeof(obj_t))
 #define MAX_OBJ_SIZE (1024)
 #define MAX_NUM_OBJS (1 << 31)     /* 2 Billion objects to transmit */
-#define MAX_NUM_OBJS_PER_BATCH (8192) /* At most 8k objects in a single write()*/
+#define MAX_NUM_OBJS_PER_BATCH (16384) /* At most 8k objects in a single write()*/
 
 /*
  * Objects to be sent
@@ -182,6 +182,8 @@ struct timeval time_diff;
  */
 uint32_t num_packets = 0; /* Number packets sent/received */
 uint32_t num_sent_received_objs = 0; /* Number objects sent/received */
+uint32_t num_sends = 0; /* # times I sender called send or write() */
+uint32_t num_recvs = 0;/* # times I sender called recv or read */
 
 
 /* Macro to print error */
@@ -238,6 +240,7 @@ static void print_stats(char *string)
   PRINT_INFO("\n%s %s Statistics:\n"
              "\tTotal Time: %lu.%lu\n"
              "\tnum_objs_per_batch = %u\n"
+             "\t%s   = %u\n"
              "\tnum_packets = %u\n"
              "\tPacket size = %u\n"
              "\tobjs/packet = %u\n"
@@ -248,6 +251,8 @@ static void print_stats(char *string)
              string,
              time_diff.tv_sec, time_diff.tv_usec,
              num_objs_per_batch,
+             is_transmitter ? "num_sends" : "num_recvs",
+             is_transmitter ? num_sends : num_recvs,
              num_packets,
              packet_size,
              packet_size/obj_size,
@@ -500,6 +505,7 @@ main (int    argc,
       while (sent_size < (ssize_t)packet_size) {
         sent_size += send(server_accept_fd, &packet[sent_size],
           packet_size - sent_size, 0);
+        num_sends++;
         /*sent_size += write(server_accept_fd, &packet[sent_size],
           packet_size - sent_size);        */
         if (sent_size < 0) {
@@ -636,6 +642,7 @@ main (int    argc,
       while (recv_size < (ssize_t)packet_size) {
         recv_size +=
           recv(sock_fd, &packet[recv_size], packet_size - recv_size, MSG_WAITALL);
+        num_recvs++;
         if (recv_size < 0) {
           PRINT_ERR("Cannot read remaining %ld packet_size=%u num_objs_per_batch=%u \n"
                     "\tnum_sent_received_objs=%u num_packets=%u: %d %s\n",
