@@ -95,7 +95,7 @@
 #define MIN_OBJ_SIZE (sizeof(obj_t))
 #define MAX_OBJ_SIZE (1024)
 #define MAX_NUM_OBJS (1 << 31)     /* 2 Billion objects to transmit */
-#define MAX_NUM_OBJS_PER_BATCH (8192) /* At most 8k objects in a single write()*/
+#define MAX_NUM_OBJS_PER_BATCH (1048576) /* At most 1M objects in a single write()*/
 
 /*
  * TCP communications

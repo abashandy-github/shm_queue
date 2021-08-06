@@ -281,7 +281,7 @@
 
 /* Max values */
 #define MAX_PACKET_SIZE  (65536)
-#define MAX_NUM_OBJS (1 << 31) /* 2 Billion objects to transmit */
+#define MAX_NUM_OBJS (MAX_UINT) /* 4 Billion objects to transmit */
 #define MAX_QUEUE_LEN (8192)  /* Maximum number of packets in the queue */
 #define MAX_QUEUE_NAME_LEN 256
 #define MAX_BATCH_SIZE (MAX_QUEUE_LEN) /* a single batch can be the entire queue*/
@@ -713,7 +713,7 @@ close_fds(void)
 static void print_stats(void)
 {
   PRINT_INFO("\n%s Statistics:\n"
-             "\tTotal Time: %lu.%lu\n"
+             "\tTotal Time: %lu.%06lu\n"
              "\tnum_batchs = %u\n"
              "\tMax batch_size = %u\n"
              "\tMax batch_size in bytes = %u\n"

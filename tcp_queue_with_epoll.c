@@ -238,7 +238,7 @@ static void print_debug(char *string, ...)
 static void print_stats(char *string)
 {
   PRINT_INFO("\n%s %s Statistics:\n"
-             "\tTotal Time: %lu.%lu\n"
+             "\tTotal Time: %lu.%06lu\n"
              "\tnum_objs_per_batch = %u\n"
              "\t%s   = %u\n"
              "\tnum_packets = %u\n"

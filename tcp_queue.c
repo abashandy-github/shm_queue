@@ -113,7 +113,7 @@
 #define MIN_OBJ_SIZE (sizeof(obj_t))
 #define MAX_OBJ_SIZE (1024)
 #define MAX_NUM_OBJS (1 << 31)     /* 2 Billion objects to transmit */
-#define MAX_NUM_OBJS_PER_BATCH (1024) /* At most 1k objects in a single write()*/
+#define MAX_NUM_OBJS_PER_BATCH (8192) /* At most 8k objects in a single write()*/
 
 /*
  * Objects to be sent
@@ -223,7 +223,7 @@ static void print_debug(char *string, ...)
 static void print_stats(char *string)
 {
   PRINT_INFO("\n%s %s Statistics:\n"
-             "\tTotal Time: %lu.%lu\n"
+             "\tTotal Time: %lu.%06lu\n"
              "\tnum_objs_per_batch = %u\n"
              "\tnum_packets = %u\n"
              "\tPacket size = %u\n"

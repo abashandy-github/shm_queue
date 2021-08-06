@@ -102,7 +102,7 @@
 #define DEFAULT_QUEUE_LEN (256) /* Number of buffers in the circular ring  */
 
 /* Max values */
-#define MAX_PACKET_SIZE  (262144 + sizeof(packet_t)) 
+#define MAX_PACKET_SIZE  (1048576 + sizeof(packet_t)) 
 #define MAX_NUM_OBJS (1 << 31) /* 2 Billion objects to transmit */
 #define MAX_QUEUE_LEN (256) /* Limited to 256 because of a bug */
 #define MAX_QUEUE_NAME_LEN 256
@@ -222,7 +222,7 @@ static void print_stats(char *string)
 {
   PRINT_INFO("\n%s %s Statistics:\n"
              "\tSingalling using %s\n"
-             "\tTotal Time: %lu.%lu\n"
+             "\tTotal Time: %lu.%06lu\n"
              "\tMax objects per batch = %u\n"
              "\tMax batch_size in bytes = %u\n"
              "\tnum_packets = %u\n"
