@@ -17,13 +17,6 @@
  * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, 
  * NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN      
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. 
-
- ** NOTE: BUG
- * There is a bug in this experimental code. If the size of the packet exceeds
- * 1024 OR the number of packets in the queue exceeds 256, the receiver starts
- * seeing obj->counter becoming zero and some pther memory corruption things
- * I never had time to fix this problem
- * Anyway, this is EXPERIMENTAL code. So bugs are not uncommon
  *
  * What is this
  * ============
@@ -31,7 +24,6 @@
  * mechanisms 
  * - AF_UNIX socket
  * - TCP socket
- * - Pipe
  * Parameters
  *   queue_name: default value "shm_queue"
  *   packet_size: Size of a single buffer in the circular ring. default value is
@@ -71,31 +63,29 @@
  * How to use
  * ----------
  * - Start the transmitter by doing
- *     <binary_name> -T
+ *     <binary_name> -t
  *   The transmitter will first delete any existing shared memory queue and
  *   then will create a new one
- * - Wait until the transmitter says
- *    "Ready for connection"
+ * - Wait until the transmitter dislays the info about the shared memory queue
  * - Start one or more receivers by doing
- *     <binary_name> -r
+ *     <binary_name>
  * - Transmission and testing will start when all receivers have started and
  *   connected to the transmitter
  *
  * How does it work
+ * ===============
  * - The sender creates the shared memory queue
- * - THe sendeer maintains one array of file descriptors
- *   - fd_receiver_ipc_array: THe file descriptor returned by "accept()"
- *     when a receiver connects to the socket that we want to compare againts
- *     If we are comparing against AF_UNIX sockets, then it will be the socket
- *     used to transmit the eventfd() file desciptors
- *     Otherwise it is another socket 
+ * - THe sender maintains one array of file descriptors
+ *   - server_accept_fd: THe file descriptors returned by "accept()"
+ *     This is the socket used to transmit the eventfd file descriptor to the
+ *     receiver 
  * - The transmitter creates two eventfd() filedescriptors
- *   - fd_signal_to_transmitter: fd used by the last receiver to
+ *   - sender_wakeup_eventfd_fd: fd used by the last receiver to
  *     dequeue high water buffers to signal the   transmitter when the
  *     transmitter blocks  because the window is full  
- *   - fd_signal_to_receiver: fd used by transmitter to signal receivers when the
- *     transmitter queues a  batch of buffers or fills the window, whichever
- *     comes first
+ *   - receiver_wakeup_eventfd_fd: fd used by transmitter to signal receivers
+ *     when the transmitter sees that the queue is empty when it starts
+ *     queueing a batch of packets
  * - Both file descriptors are sent to each receiver when the receiver connects
  *   using an SCM_RIGHTS ancillary message
  * - The receiver does the following
@@ -134,32 +124,25 @@
  *    2.1 pulse_receiver = true;
  * 3. else
  *    3.1 pulse receiver = false
- * 4. queue one batch  as follows
+ * 4. curr_batch_size =
+ *      min(queue_len - number_queued_packets, remaining_objects/obj_per_packet)
+ * 5. Unlock(eueu->mutex>
+ * 6. queue one batch  as follows
  *    for (i = 0; i < batch_size; i++) {
- *       If queue->num_queued_packets == queue->queued_len
- *         unlock(queue->mutex)
- *         epoll on sender_wakeup_eventfd_fd
- *       else
- *         unlock(queue->mutex)
- *         buffer = queue->packets[queue->tail]
- *         pack as much objects into that buffer as you can
- *         lock(queue->mutex)
- *         queue->head = (queue->tail++) % queue->queue_len
- *         queue->num_queued_packets++;
- *         unlock(queue->mutex)
- *         NOTE: Further OPTIMIZATION
- *          It is possible to pack multiple packets in one shot and
- *          increment queue->head and queue->num_queued_packets by a batch
- *          size instead of by "1"
- *          However, this can be viewed as if we have made a single packet
- *          the size of an entire batch of packets and reduced the queue_len
- *          by that factor
- *       endif
+ *       packet objects into a single packet
+ *       add the packet at position (queue->tail % queue->queue_len
  *     endfor
- * 5. if (pulse_receiver) {
- *    5.1 write(receiver_wakeup_eventfd_fd)
- * 6. Perform some processing to emulate worker thread has nothing to send
- * 7. Loop back to step 1
+ * 7. if (pulse_receiver) {
+ *      write(receiver_wakeup_eventfd_fd)
+ * 8. lock(queue->mutex)
+ * 9. queue->tail = (queue->tail + curr_batch_size) % queue->queue_len
+ * 10.  queue->num_queue_packet += curr_batch_size
+ * 11.  if (queue->num_queue_packet == queue->queue_len)
+ *        queue->high_water_mark_reached = true;
+ * 12. Unlock(queue->mutex)
+ * 13. If high waiter mark reached
+ * 14    Wait for pulse from receiver
+ * 14. Loop back to step 1
  *    - 
  *        
  * How the receiver receives objects from the queue
@@ -167,12 +150,14 @@
  * 1. Receiver epoll on receiver_wakeup_eventfd_fd
  * 2. lock(queue->mutex)
  * 3. if high_water_mark_reached == false
- *    3.1 If queue is full I.e. sender is waiting until queue reaches low water mark
+ *    3.1 If queue is full
+ *        (I.e. sender is waiting until queue reaches low water mark)
  *        3.1.1 high_water_mark_reached = true;
  *    3.2 else
  *        4.1.1 high_water_mark_reached = false;
  *    3.3 endif
  * 4. endif 
+ * 4.5 curr_batch_size = min(batch_size, queue->num_queued_packets)
  * 5. unlock(queue->mutex)
  * 6. Dequeue one batch  as follows
  *    for (i = 0; i < min(batch_size, queue->num_queued_packets); i++) {
@@ -182,16 +167,19 @@
  *       do some processing to emulate receiver doing some work on objects
  * 7. endfor   
  * 8. lock(queue->mutex)
- * 9. queue->head = (queue->head + min(batch_size, queue->num_queued_packets))
+ * 9. queue->head = (queue->head + curr_batch_size)
  *                   % queue->queue_len
- * 10. queue->num_queued_packets -= min(batch_size, queue->num_queued_packets))
+ * 10. queue->num_queued_packets -= curr_batch_size
  * 11. unlock(queue->mutex) 
  * 12. If (queue->num_queued_packets == 0) {
- *      high_water_mark_reached = false * of course we are out of high water mark
- *      goto line 1  * no more items in the queue, wait on receiver_wakeup_eventfd_fd
+ *      high_water_mark_reached = false
+ *      (of course we are out of high water mark)
+ *      goto line 1
+ *       (no more items in the queue, wait on receiver_wakeup_eventfd_fd,
+ *        which will come when sender queues one or more packets)
  * 13. else
- *       * Still some items in the queue. So we have to pulse ourselves
- *       write(receiver_wakeup_eventfd_fd)
+ *       Still some items in the queue. So we have to pulse ourselves
+ *       got back to step 1
  *       
  *       * If we have reached the high water mark, see if we went lower than the
  *         low water mark. If so, pulse the transmitter
@@ -202,8 +190,15 @@
  *          endif
  *       endif
  * 14. endif
-
+ *
+ *
  * 
+ * NOTE:
+ * The same idea can be applied by assuming that the queue is a single
+ * contnuous buffers and both head and tail move in increments of bytes
+ * instead of increments of packets
+ *
+
 
  *****************************************************************/
 
@@ -273,19 +268,21 @@
 
 
 /* Default values for the samred memory queue*/
-#define DEFAULT_PACKET_SIZE  (1024) /* Size of a single buffer inthe ring */
+#define DEFAULT_NUM_RECEIVERS (1)
+#define DEFAULT_PACKET_SIZE (8192) /* Size of a single buffer in the ring */
 #define DEFAULT_NUM_OBJS (1 << 20) /* 1M objects to send */
 #define DEFAULT_QUEUE_LEN (256) /* Number of buffers in the circular ring  */
 #define DEFAULT_QUEUE_NAME "shm_queue"
-#define DEFAULT_BATCH_SIZE (32)/* # packets to write or read before sender writes
-                                  to or receiver waits on eventfd, respectively */
+#define DEFAULT_BATCH_SIZE (32)/* # packets to write or read before sender
+                                  writes to or receiver waits on eventfd,
+                                  respectively */
 #define DEFAULT_QUEUE_LOW_WATER (DEFAULT_QUEUE_LEN >> 1) /* 1/2 the queue */
 #define DEFAULT_SLOW_FACTOR (0) /* Looping to slow sender or receiver down */
 
 /* Max values */
-#define MAX_PACKET_SIZE  (1024) /* Limited to 1024 because of some bug */
+#define MAX_PACKET_SIZE  (65536)
 #define MAX_NUM_OBJS (1 << 31) /* 2 Billion objects to transmit */
-#define MAX_QUEUE_LEN (256) /* Limited to 256 because of a bug */
+#define MAX_QUEUE_LEN (8192)  /* Maximum number of packets in the queue */
 #define MAX_QUEUE_NAME_LEN 256
 #define MAX_BATCH_SIZE (MAX_QUEUE_LEN) /* a single batch can be the entire queue*/
 
@@ -440,15 +437,15 @@ uint32_t num_batchs = 0; /* Number of batches of packets sent/received */
 uint32_t num_packets = 0; /* Number packets sent/received */
 uint32_t num_sent_received_objs = 0; /* Number objects sent/received */
 uint32_t num_receiver_wakeup_needed = 0; /* For sender : number of times sender
-                                            pulsed recevr
-                                            For receiver: number of times the
+                                            pulsed recever */
+uint32_t num_receiver_pulse_myself = 0; /* For receiver: number of times the
                                             receiver pulsed itself because
                                             after draining a batch, the
                                             receiver found that there are
                                             still more queued packets and
                                             hence it had to pulse itself to
                                             wakeup later and continue draining
-                                            these packets  */
+                                            these packets */
 uint32_t num_sender_wakeup_needed = 0; /* number of times sender waited for
                                           recevieer. Needed when queue reached
                                           high water mark and sender has to
@@ -629,8 +626,8 @@ close_fds(void)
 /*
  * send a single pulse to receiver
  */
-#define PULSE_RECEIVER(pulse)                 \
-do {                                          \
+#define PULSE_RECEIVER(pulse, is_transmitter) \
+  do {                                                          \
   uint64_t eventfd_write = pulse;                               \
   if (write(receiver_wakeup_eventfd_fd, &eventfd_write, sizeof(eventfd_write))\
       !=  sizeof(eventfd_write)) {                                      \
@@ -648,7 +645,11 @@ do {                                          \
               errno, strerror(errno));                                  \
     exit(EXIT_FAILURE);                                                 \
   } else {                                                              \
-    num_receiver_wakeup_needed++;                                       \
+    if (is_transmitter) {                                               \
+      num_receiver_wakeup_needed++;                                     \
+    } else {                                                            \
+      num_receiver_pulse_myself++;                                      \
+    }                                                                   \
     PRINT_DEBUG("SUCCESSFULLY pulsed %zu to receiver_wakeup fd %d.\n "  \
                 "\tSo far receiver_wakeup_needed %u.\n"                 \
                 "\tSo far sent %d objects %u packets %u batchs "        \
@@ -721,12 +722,13 @@ static void print_stats(void)
              "\tobjs/packet = %u\n"
              "\tobj size = %u\n"
              "\tnum_sent_received_objs = %u\n"
-             "\tnum_receiver_wakeup_needed = %u\n"
+             "\t%s = %u\n"
              "\tnum_sender_wakeup_needed = %u\n"
              "\tnum_lost_objs = %u\n"
              "\tnum_pulse_myself  = %u\n"
              "\tnum_low_water_mark_reached=%u\n"
              "\tSlow factor = %u\n"
+             "%s %s"
              "\tqueue = (%s)\n",
              is_transmitter ? "Sender" : "Receiver",
              time_diff.tv_sec, time_diff.tv_usec,
@@ -738,12 +740,17 @@ static void print_stats(void)
              queue->packet_size/queue->obj_size,
              queue->obj_size,
              num_sent_received_objs,
+             is_transmitter ? "num_receiver_wakeup_needed" :
+             "num_receiver_pulse_myself",
              num_receiver_wakeup_needed,
              num_sender_wakeup_needed,
              num_lost_objs,
              num_pulse_myself,
              num_low_water_mark_reached,
              slow_factor,
+             is_transmitter ? "" : "\treceiver_defer_after_each_batch = ",
+             is_transmitter ? "" :
+             (receiver_defer_after_each_batch ? "true\n" : "false\n"),
              print_queue(queue));
 }
 
@@ -1047,7 +1054,7 @@ print_usage (const char *progname)
   fprintf (stdout,
            "usage: %s [options] \n"
            "\t-a Use Adaptive Mutex (non-portable)\n"
-           "\t-d receiver defer dequeing after each batch by pulsing ourselves (default '%s')\n"
+           "\t-d receiver defer dequeing after each batch by pulsing itself (default '%s')\n"
            "\t-t Transmitter mode instead of the default receiver mode\n"
            "\t-s <slow_factor> default %u\n"
            "\t-S <sockpath>: user another socket path instead of default '%s'\n"
@@ -1107,7 +1114,7 @@ main (int    argc,
         is_adaptive_mutex = true;
         break;
       case 'd':
-        receiver_defer_after_each_batch = false;
+        receiver_defer_after_each_batch = true;
         break;
       case 't':
         is_transmitter = true;
@@ -1379,13 +1386,13 @@ main (int    argc,
       return EXIT_FAILURE;
     }
     queue = mmap(0,
-                 window_size,
+                 sizeof(*queue),
                  PROT_READ | PROT_WRITE,
                  MAP_SHARED, /* MUST have for file-backed window */
                  shm_fd, 0);
     if (!queue) {
-      PRINT_ERR( "\nCannot map '%s' %u bytes shm_fd %d: %d %s", queue_name,
-                 window_size, shm_fd,
+      PRINT_ERR( "\nCannot map '%s' %zu bytes shm_fd %d: %d %s", queue_name,
+                 sizeof(*queue), shm_fd,
                  errno, strerror(errno));
       return EXIT_FAILURE;
     }
@@ -1401,47 +1408,74 @@ main (int    argc,
     packet_size = queue->packet_size;
     obj_size = queue->obj_size;
     window_size = queue->window_size;
+
+    /*
+     * Unmap then remap using the size obtained from reading the queue header
+     */
+    if (munmap(queue, sizeof(*queue)) < 0) {
+      PRINT_ERR("Cannot unmap %p size %zu shm_fd %d name '%s': %d %s\n",
+                queue, sizeof(*queue), shm_fd,
+                queue_name,
+                errno, strerror(errno));
+      return EXIT_FAILURE;
+    }
+
+    queue = mmap(0,
+                 window_size,
+                 PROT_READ | PROT_WRITE,
+                 MAP_SHARED, /* MUST have for file-backed window */
+                 shm_fd, 0);
+    if (!queue) {
+      PRINT_ERR( "\nCannot RE-map '%s' %u bytes shm_fd %d: %d %s", queue_name,
+                 window_size, shm_fd,
+                 errno, strerror(errno));
+      return EXIT_FAILURE;
+    }
   }
-  
+
   /* Number of objects to pack/unpack into/from a packet */
   objs_per_packet = (queue->packet_size - (uint32_t)sizeof(packet_t))/obj_size;
 
 
   /* Print the shared memory queue parameters */
   PRINT_INFO("\n%s Shared memory queue:\n"
-              "Name:                                         %s\n"
-              "Queue Len:                                    %u\n"
-              "Low water Mark:                               %u\n"
-              "Adaptive mutex                                %s\n"
-              "Single packet size:                           %u\n"
-              "Single payload size:                          %lu\n"
-              "Object size:                                  %u\n"
-              "Objects per packet:                           %u\n"
-              "Max single Batch Size (in packets):           %u\n"
-              "Max batch size (in bytes):                    %u\n"
-              "Number of objects in a max batch:             %u\n"
-              "Total payload size in a max batch in bytes:   %u\n"
-              "Total number of objects to %s           %u\n"
-              "Total queue size in bytes:                    %u\n"
-              "Total packet buffer in bytes:                 %lu\n"
-              "Slow factor                                   %u\n",
-              is_transmitter ? "Transmitter" : "Receiver",
-              queue_name,
-              queue->queue_len,
-              low_water_mark,
-              is_adaptive_mutex ? "true" : "false",
-              queue->packet_size,
-              queue->packet_size - offsetof(packet_t, data),
-              obj_size,
-              objs_per_packet,
-              batch_size,
-              batch_size * queue->packet_size,
+             "Name:                                         %s\n"
+             "Queue Len:                                    %u\n"
+             "Low water Mark:                               %u\n"
+             "Adaptive mutex                                %s\n"
+             "Single packet size:                           %u\n"
+             "Single payload size:                          %lu\n"
+             "Object size:                                  %u\n"
+             "Objects per packet:                           %u\n"
+             "Max single Batch Size (in packets):           %u\n"
+             "Max batch size (in bytes):                    %u\n"
+             "Number of objects in a max batch:             %u\n"
+             "Total payload size in a max batch in bytes:   %u\n"
+             "Total number of objects to %s           %u\n"
+             "Total queue size in bytes:                    %u\n"
+             "Total packet buffer in bytes:                 %lu\n"
+             "Slow factor                                   %u\n"
+             "%s               %s\n",
+             is_transmitter ? "Transmitter" : "Receiver",
+             queue_name,
+             queue->queue_len,
+             low_water_mark,
+             is_adaptive_mutex ? "true" : "false",
+             queue->packet_size,
+             queue->packet_size - offsetof(packet_t, data),
+             obj_size,
+             objs_per_packet,
+             batch_size,
+             batch_size * queue->packet_size,
              batch_size * objs_per_packet,
-              batch_size * objs_per_packet * queue->obj_size,
+             batch_size * objs_per_packet * queue->obj_size,
              is_transmitter ? "send:   " : "receive:", num_objs,
              window_size,
              window_size - offsetof(shm_queue_t, packets),
-             slow_factor);
+             slow_factor,
+             is_transmitter ? "" : "receiver_defer_after_each_batch",
+             is_transmitter ? "" : 
+             (receiver_defer_after_each_batch ? "true\n" : "false\n"));
   
   
   
@@ -1598,8 +1632,8 @@ main (int    argc,
     /* Sleep for 1 second after all receivers connect to make sure that all
      * receivers have called poll() or read to wait on the eventfd
      */
-    PRINT_DEBUG("Waiting to let receivers wait on the eventfd() filedescriptor\n");
-    sleep(2);
+    /*PRINT_INFO("Waiting to let receivers wait on the eventfd() filedescriptor\n");
+      sleep(2);*/
       
     
   } else {
@@ -1804,19 +1838,20 @@ main (int    argc,
        */
       QUEUE_LOCK;
       QUEUE_TAIL_INC(curr_batch_size);
-          PRINT_DEBUG("***ADVANCED TAIL by curr_batch %u object counter %u %uth packet sequence %u tail %u, "
-                      "from data %p packet %p\n"
-                      "\tSo far sender_wakeup_needed %u lost objects %u.\n"
-                      "\tSo sent %d objects %u packets %u batchs\n"
-                      "\tqueue=(%s)\n",
-                      curr_batch_size,
-                      obj->counter, i, packet->sequence, queue->tail, data, packet,
-                      num_sender_wakeup_needed,
-                      num_lost_objs,
-                      num_sent_received_objs,
-                      num_packets,
-                      num_batchs,
-                      print_queue(queue));
+      PRINT_DEBUG("***ADVANCED TAIL by curr_batch %u object counter %u %uth "
+                  "packet sequence %u tail %u, "
+                  "from data %p packet %p\n"
+                  "\tSo far sender_wakeup_needed %u lost objects %u.\n"
+                  "\tSo sent %d objects %u packets %u batchs\n"
+                  "\tqueue=(%s)\n",
+                  curr_batch_size,
+                  obj->counter, i, packet->sequence, queue->tail, data, packet,
+                  num_sender_wakeup_needed,
+                  num_lost_objs,
+                  num_sent_received_objs,
+                  num_packets,
+                  num_batchs,
+                  print_queue(queue));
       
       if (queue->queue_len == queue->num_queued_packets) {
         queue->high_water_mark_reached = true;
@@ -1846,7 +1881,7 @@ main (int    argc,
         if(is_pulse_receiver) {
            is_pulse_receiver = false; /* NO need anymore because I just
                                         pulsed receiver*/
-           PULSE_RECEIVER(num_receivers);
+           PULSE_RECEIVER(num_receivers, is_transmitter);
         }
         /* wait */
         rc = epoll_wait(epoll_fd, &event, 1, -1);
@@ -1857,7 +1892,8 @@ main (int    argc,
                     print_queue(queue), errno, strerror(errno));
           exit(EXIT_FAILURE);
         } else {
-          PRINT_DEBUG("Successfully came out of epoll_wait epoll_fd=%d sender_evenfd %d queue=(%s)\n",
+          PRINT_DEBUG("Successfully came out of epoll_wait epoll_fd=%d "
+                      "sender_evenfd %d queue=(%s)\n",
                       epoll_fd, sender_wakeup_eventfd_fd,
                     print_queue(queue));
           /* the eventfd are ruinning in semaphore moddde. Hence we have read to
@@ -1883,7 +1919,7 @@ main (int    argc,
          we have reached the high water mark AND the receiver said it will
          wait on epoll_wait() for a pulse from the sender */
       if (is_pulse_receiver) {
-        PULSE_RECEIVER(num_receivers);
+        PULSE_RECEIVER(num_receivers, is_transmitter);
       }
       /* Slow ourselves if we requested */
       for (i = 0; i < slow_factor; i++) {
@@ -2070,11 +2106,12 @@ main (int    argc,
       pulse_myself = !!(queue->num_queued_packets);
 
       /*
-       * If I am NOT going to pulse myself then I will need a wakeup pulse from
-       * the sender
+       * If I am NOT going to pulse myself then this means that the queue is
+       * empty and hence  I will need a wakeup pulse from the sender
        */
       queue->receiver_waiting_for_pulse_from_sender = !pulse_myself;
-      num_receiver_wakeup_needed += queue->receiver_waiting_for_pulse_from_sender;
+      num_receiver_wakeup_needed +=
+        queue->receiver_waiting_for_pulse_from_sender;
 
       /*
        * If, before, while, or after we draining this batch, sender exceeded
@@ -2139,10 +2176,10 @@ main (int    argc,
       /* If we have to pulse ourself, let's do that  */
       if (pulse_myself) {
         /* If the user requested that if there are still some packets in the
-           queue  we continuue dequeue immediately instead of 
+           queue  receiver continuue dequeue immediately instead of
            deferring the dequeue after each batch, let's do that */
         if (receiver_defer_after_each_batch) {
-          PULSE_RECEIVER(1); /* Just ourselves, so it is "1" */
+          PULSE_RECEIVER(1, is_transmitter); /* Just ourselves, so it is "1" */
         } else {
           goto begin_receive_loop;
         }
