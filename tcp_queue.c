@@ -31,10 +31,13 @@
  *   rm tcp_queue; gcc -g -O0 -o tcp_queue tcp_queue.c -lrt -pthread -Wall -Wextra
  * How to run
  * ==========
- * - In one window do the server
+ * - In one window do the sender
  *     ./tcp_queue -t -o 20 -b 88 -n 1000000000 -p 65001
- * - In another window run the client
+ * - In another window run the receiver
  *    ./tcp_queue -o 20 -b 88 -n 1000000000 -p 65001
+ *
+ * for multiple receivers, use -r <n> on both sender and receiver with the same
+ * "n" value 
  *
  * For the options, do
  *    ./tcp_queue -h
@@ -104,16 +107,20 @@
 
 
 /* default and max data item size */
+#define DEFAULT_NUM_RECEIVERS (1)
 #define DEFAULT_NUM_OBJS (1 << 20) /* 1M objects to send */
 #define DEFAULT_OBJ_SIZE (sizeof(obj_t) + 30)
 #define DEFAULT_SERVER_PORT (65000)
 #define DEFAULT_NUM_OBJS_PER_BATCH (32)/* # packets to write or read in one shot */
 
-#define MAX_NUM_RECEIVERS (1)
 #define MIN_OBJ_SIZE (sizeof(obj_t))
 #define MAX_OBJ_SIZE (1024)
 #define MAX_NUM_OBJS (1 << 31)     /* 2 Billion objects to transmit */
-#define MAX_NUM_OBJS_PER_BATCH (8192) /* At most 8k objects in a single write()*/
+#define MAX_NUM_OBJS_PER_BATCH (8192)/* At most 8k objects in a single write()*/
+/*
+ * max and default values for the transmitter-receiver communciation
+ */
+#define MAX_NUM_RECEIVERS (64)
 
 /*
  * Objects to be sent
@@ -135,11 +142,12 @@ static obj_t *obj;
 static uint32_t obj_size = DEFAULT_OBJ_SIZE;
 static uint32_t num_objs = DEFAULT_NUM_OBJS;
 static uint16_t server_port = DEFAULT_SERVER_PORT;
+static uint32_t num_receivers = DEFAULT_NUM_RECEIVERS;
 
 /*
  * socket to accept receivers 
  */
-static int server_accept_fd = -1;
+static int server_accept_fd[MAX_NUM_RECEIVERS];
 
 static uint32_t packet_size = 0;
 /* # packets for transmitter to write or receiver to read 
@@ -225,7 +233,7 @@ static void print_stats(char *string)
   PRINT_INFO("\n%s %s Statistics:\n"
              "\tTotal Time: %lu.%06lu\n"
              "\tnum_objs_per_batch = %u\n"
-             "\tnum_packets = %u\n"
+             "\tnum_packets %s = %u\n"
              "\tPacket size = %u\n"
              "\tobjs/packet = %u\n"
              "\tobj size = %u\n"
@@ -234,6 +242,7 @@ static void print_stats(char *string)
              string,
              time_diff.tv_sec, time_diff.tv_usec,
              num_objs_per_batch,
+             is_transmitter ? "sent" : "received",
              num_packets,
              packet_size,
              packet_size/obj_size,
@@ -253,7 +262,9 @@ signal_handler(int s __attribute__ ((unused)))
                sock_fd);
   
   close(sock_fd);
-  close(server_accept_fd);
+  for (uint32_t i = 0; i < num_receivers; i++) {
+    close(server_accept_fd[i]);
+  }
   print_stats("Signal Caught");
   exit(EXIT_SUCCESS); 
 }
@@ -327,7 +338,17 @@ main (int    argc,
           exit (EXIT_FAILURE);
         }
         break;
-        
+      case 'r':
+        if (1 != sscanf(optarg, "%u", &num_receivers)) {
+          PRINT_ERR("\nCannot read number of receivers %s. \n", optarg);
+          exit (EXIT_FAILURE);
+        }
+        if (num_receivers > MAX_NUM_RECEIVERS || !num_receivers) {
+          PRINT_ERR("\nInvalid number of receivers %s. "
+                    "Must be between 1 and %u\n", optarg, MAX_NUM_RECEIVERS);
+          exit (EXIT_FAILURE);
+        }
+        break;
       case 'b':
         if (1 != sscanf(optarg, "%u", &num_objs_per_batch)) {
           PRINT_ERR("\nCannot read batch size %s. \n", optarg);
@@ -394,6 +415,13 @@ main (int    argc,
     goto out;
   }
 
+  /*
+   * Init the array of receiver file descriptors
+   */
+  for (i = 0; i < MAX_NUM_RECEIVERS; i++) {
+    server_accept_fd[i] = -1;
+  }
+
   /* Create the TCP socket. */
   sock_fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock_fd < 0) {
@@ -430,18 +458,21 @@ main (int    argc,
       ret_val = EXIT_FAILURE;
       goto out;
     }
-    if ((server_accept_fd = accept(sock_fd,
-                                      (struct sockaddr *)&sockaddr,
-                                      &remote_len)) == -1) {
-      PRINT_ERR("accept() sock_fd %d remote_len=%u "
-                "failed : %d %s\n",
-                sock_fd, remote_len, errno, strerror(errno));
-      ret_val = EXIT_FAILURE;
-      goto out;
-    } else {
-      PRINT_INFO("Success accept() sock_fd %d accept_fd %u remote_len=%u\n",
-                sock_fd, remote_len, server_accept_fd);
+    for (i = 0; i < num_receivers; i++) {
+      remote_len = sizeof(sockaddr);
+      if ((server_accept_fd[i] = accept(sock_fd,
+                                        (struct sockaddr *)&sockaddr,
+                                        &remote_len)) == -1) {
+        PRINT_ERR("accept() receiver (%d) sock_fd %d remote_len=%u "
+                  "failed : %d %s\n",
+                  i, sock_fd, remote_len, errno, strerror(errno));
+        exit(EXIT_FAILURE);
+      }
+
+      PRINT_INFO("Connected to receiver %d accept_fd %d , len %d.\n",
+                 i, server_accept_fd[i],remote_len);
     }
+    PRINT_INFO("Connected to %u receivers..\n\n",num_receivers);
 
     /* get time stamp when stazrting to send */
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
@@ -460,18 +491,23 @@ main (int    argc,
         temp_packet += obj_size;
       }
       /* Send the apcket */
-      ssize_t j = send(server_accept_fd, packet, packet_size, 0);
-      if (j != (ssize_t)packet_size) {
-        PRINT_ERR("Sent INVALID size %d packet_size=%u num_objs_per_batch=%u \n"
-                  "\tnum_sent_received_objs=%u num_packets=%u: %d %s\n", (int32_t)j,
-                  packet_size, num_objs_per_batch,
-                  num_sent_received_objs, num_packets,
-                  errno, strerror(errno));
-        ret_val = EXIT_FAILURE;
-        goto out;
+      for (i = 0; i < num_receivers; i++) {
+        ssize_t j = send(server_accept_fd[i], packet, packet_size, 0);
+        if (j != (ssize_t)packet_size) {
+          PRINT_ERR("Sent to receiever %d INVALID size %d "
+                    "packet_size=%u num_objs_per_batch=%u \n"
+                    "\tnum_sent_received_objs=%u num_packets=%u: %d %s\n",
+                    i,
+                    (int32_t)j,
+                    packet_size, num_objs_per_batch,
+                    num_sent_received_objs, num_packets,
+                    errno, strerror(errno));
+          ret_val = EXIT_FAILURE;
+          goto out;
+        }
+        num_packets++;
       }
       num_sent_received_objs += num_objs_per_batch;
-      num_packets++;
     }
     /* get time stamp when finish sending */
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
@@ -546,7 +582,9 @@ main (int    argc,
   print_stats("Exitting");
 
   close(sock_fd);
-  close(server_accept_fd);
+  for (i=0; i < num_receivers; i++) {
+    close(server_accept_fd[i]);
+  }
 
   exit(ret_val);
 }

@@ -72,8 +72,38 @@
  * - Transmission and testing will start when all receivers have started and
  *   connected to the transmitter
  *
- * How does it work
- * ===============
+ * How to use for multiple receivers,
+ * ------------------------
+ * - On the sender use "-r <n> -u" to specify "n" receiver and the the use of
+ *   "AF_UNIX" socket for singalling instead of eventfd
+ * - On the receivers
+ *   - On each receiver use "-r <n> -u" to specify "n" receiver and the use of
+ *     "AF_UNIX" socket for singalling instead of eventfd wheren "n" on the
+ *     receiver MUST be the same value as used oin the sender
+ *   - Specify a DISTINCT receiver ID using -i <id> for each receiver where the
+ *     value of "<id>" MUST be strictly less than "<n>"
+ *
+ * Example of multiple receiver uses
+ * ----------------------------------
+ * Sender:
+ *  ./shm_queue -t -n 1000000000 -p 50000 -b 2 -o 50 -a -r 3 -u
+ * -r 3 This is expecting exactly 3 receivers
+ * -n 1000000000 : 1 billion objects
+ * -p 50000; Each packet is 50,000 bytes
+ * -b 2: A batch of 2 packets is sent at a time
+ * -a : (optional) Use non-standard adaptive mutex
+ * -u: Use AF_UNIX socket for signaling. Mandatory for multi-receiver
+ *
+ * Receiver 0:
+ *   ./shm_queue -n 1000000000 -p 50000 -b 2 -o 50 -r3 -i0 -u
+ * Receiver 0:
+ *   ./shm_queue -n 1000000000 -p 50000 -b 2 -o 50 -r3 -i1 -u
+ * Receiver 2:
+ *   ./shm_queue -n 1000000000 -p 50000 -b 2 -o 50 -r3 -i2 -u
+ *
+ *
+ * How SINGLE RECEIVER works
+ * =========================
  * - The sender creates the shared memory queue
  * - THe sender maintains one array of file descriptors
  *   - server_accept_fd: THe file descriptors returned by "accept()"
@@ -116,7 +146,7 @@
  *        fd_receiver_ipc_array 
  * - Start the test
  * 
- * How the transmitter sends objects to the receiver(s)
+ * How the transmitter sends objects to the SINGLE receiver
  * ==================================================================
  * queue any number of packets as follows
  * 1. lock(queue->mutex)
@@ -145,7 +175,7 @@
  * 14. Loop back to step 1
  *    - 
  *        
- * How the receiver receives objects from the queue
+ * How the SINGLE receiver receives objects from the queue
  * ================================================
  * 1. Receiver epoll on receiver_wakeup_eventfd_fd
  * 2. lock(queue->mutex)
@@ -192,11 +222,40 @@
  * 14. endif
  *
  *
+ * How Multiple Receivers works
+ *-=============================
+ * - Similar to the single receiver cases
+ * - More details: TBD
  * 
+ *
  * NOTE:
  * The same idea can be applied by assuming that the queue is a single
  * contnuous buffers and both head and tail move in increments of bytes
  * instead of increments of packets
+ *
+ * NOTE: regarding using eventfd with multiple receivers
+ *- As it has been tested before, it is possible for multiple processes to wait
+ *  on the same eventfd file descriptor using epoll_wait() and have a single
+ *  wite() to that eventfd wake up all these pprocess out of epoll_wait()
+ * - But I noticed that When I use eventfd with multiple receivers, I can see
+ *   that a pulse gets lost and we fall into a deadlock after ew hundred
+ *   thousands to few million objects. Hence I wll NOt use it
+ * - This may very well be a bug in my code or the fact that a single write
+ *   to an eventfd cannot be used reliably to wakeup multiple waiters on that
+ *   same eventfd using epoll_wait()
+ * - HEnce I am disallowing the use of eventfd for signaling from sender to
+ *   recievers when there are more than one receiver
+ * - Instead, I am using the AF_UNIX socket that was used to send the
+ *   SCM_RIGHTS message for signaling by individually sending a single byte to
+ *   each receiver by the sender or from a receiver to the sender
+ * - I even disallowed using eventfd with multiple receivers for a receiver to
+ *   pulse itself when the user uses the "-d" option because I saw some
+ *   problems
+ * - Bottom line, it seems sharing the same eventfd file descriptors among
+ *   multiple processes (and possibly multiple threads within the same process)
+ *   is either unreliable OR needs some different code
+ * - this is not the issue that we are tackling in this code so we will not
+ *   look at it as this point in time
  *
 
 
@@ -281,7 +340,7 @@
 
 /* Max values */
 #define MAX_PACKET_SIZE  (65536)
-#define MAX_NUM_OBJS (MAX_UINT) /* 4 Billion objects to transmit */
+#define MAX_NUM_OBJS (UINT32_MAX) /* 4 Billion objects to transmit */
 #define MAX_QUEUE_LEN (8192)  /* Maximum number of packets in the queue */
 #define MAX_QUEUE_NAME_LEN 256
 #define MAX_BATCH_SIZE (MAX_QUEUE_LEN) /* a single batch can be the entire queue*/
@@ -294,7 +353,7 @@
 /*
  * max and default values for the transmitter-receiver communciation
  */
-#define MAX_NUM_RECEIVERS (4)
+#define MAX_NUM_RECEIVERS (64)
 
 
 /*
@@ -315,51 +374,40 @@ typedef struct packet_t_ {
   uint8_t data[];
 } packet_t;
 
+
+/*
+ * per receiver queue info
+ */
+typedef struct shm_receiver_queue_t_ {
+  bool high_water_mark_reached;
+  bool receiver_waiting_for_pulse_from_sender; /* true when receiver is waiting
+                                                  for sender to wake it up*/
+  uint32_t head; /* where receiver dequeues packets */
+  uint32_t num_queued_packets; /* # packets still queue for this receiver */
+  uint32_t receiver_id; /* to catch running more than one reciver with the same
+                           ID */
+} shm_receiver_queue_t;
+
 /*
  * the queue
  */
 typedef struct shm_queue_t_ {
-  bool high_water_mark_reached;
+  /* per queue info */
   uint32_t obj_size;
-  bool receiver_waiting_for_pulse_from_sender; /* true when receiver is waiting
-                                                  for sender to wake it up*/
   uint32_t queue_len; /* total Number of packets in the queue */
   uint32_t window_size; /* total Number of byte of the shared mem window */
-  uint32_t head; /* where receiver dequeues packets */
   uint32_t tail; /* where sender enqueues packets */
   uint32_t packet_size; /* packet size */
-  uint32_t num_queued_packets; /* Number off pacckets in the queue */
+  uint32_t num_receivers; /* Number of receivers expected by the sender */
   pthread_mutex_t mutex; /* mutual exclusion between sender/receiver */
+  bool is_adaptive_mutex;
+
+  /* Per receiver info */
+  shm_receiver_queue_t receiver_queue[MAX_NUM_RECEIVERS];;
+
+  /* the packets carrying payload*/
   uint8_t packets[]; /* the actual list of packets */
 } shm_queue_t;
-
-
-static char *
-print_packet(packet_t *packet)
-{
-  static char buf[1025];
-  memset(buf, 0, sizeof(buf));
-  snprintf(buf, 1024, "seq=%u num_objs=%u",
-           packet->sequence,
-           packet->num_objs);
-  return (buf);
-}
-
-static char *
-print_queue(shm_queue_t *queue)
-{
-  static char buf[1025];
-  memset(buf, 0, sizeof(buf));
-  snprintf(buf, 1024, "len=%u head=%u tail=%u queued=%u pack_size=%u HW=%s",
-           queue->queue_len,
-           queue->head,
-           queue->tail,
-           queue->num_queued_packets,
-           queue->packet_size,
-           queue->high_water_mark_reached ? "T" : "F");
-           
-  return(buf);
-}
 
 
 /* default and max data item size */
@@ -402,6 +450,13 @@ static int eventfd_flags = EFD_NONBLOCK | EFD_SEMAPHORE;
  * to be false
  */
 bool receiver_defer_after_each_batch = false;
+
+
+/*
+ * Use eventfd to pulse receivers instead of individually pulsing the AF_UNIX
+ * socket of each receiver
+ */
+bool is_use_eventfd_to_pulse_receivers = true;
 
 /* Variables for the window */
 static uint32_t queue_len = DEFAULT_QUEUE_LEN;
@@ -466,8 +521,25 @@ uint32_t num_pulse_myself = 0; /* # times receiver had to pulse itself because
                                     packets in the queue */
 
 /* Number of times recevier saw the high water mark flag set then the size of
-   the queue goes below the low water mark*/
-uint32_t num_low_water_mark_reached = 0;
+   the queue goes below the low water mark AND we were the last receiver that
+   had our high water mark then go below low water mark
+   As a result of that, we will pulse the sender out of epoll_wait()*/
+uint32_t num_last_receiver_reach_low_water_mark = 0;
+/* Number of times recevier saw the high water mark flag set then the size of
+   the queue goes below the low water mark NUT we were NOT the last receiver
+   that had our high water mark then go below low water mark
+   Hence we will NOT pulse the sender*/
+uint32_t num_non_last_receiver_reach_low_water_mark = 0;
+
+/* Number of times the sender attempted to send a batch but coundn't because
+   the current batch size is zero because the queue of one of the receivers is
+   full (or VERY UNLIKELY because all objects were sent) */
+uint32_t num_sender_zero_curr_batch_size = 0;
+
+/*
+ * reveiver ID
+ */
+static uint32_t receiver_id = UINT32_MAX;
 
 
 /*
@@ -496,7 +568,7 @@ struct timeval time_diff;
     print_debug("%s %d: " str, __FUNCTION__, __LINE__, ##param);        \
   } while (false);
 
-#ifdef DEBUGENABLE
+#ifdef DEBUG_ENABLE
 #define PRINT_DEBUG(str, param...)                                      \
   do {                                                                  \
     print_debug("%s %d: " str, __FUNCTION__, __LINE__, ##param);        \
@@ -539,18 +611,26 @@ struct timeval time_diff;
  * To use bitwise AND instead of long division to do "mod" opeation, we assume
  * that the queue length is a pwoer of 2
  */
-#define QUEUE_HEAD_INC(my_batch_size)                                   \
-do {                                                                    \
-  assert(!(my_batch_size > queue->num_queued_packets));                \
-  queue->num_queued_packets -= my_batch_size;                           \
-  queue->head = (queue->head + my_batch_size) & (queue->queue_len - 1); \
- } while (false)
-
-#define QUEUE_TAIL_INC(my_batch_size)                                   \
+/* Each receiver individually increments its own queue */
+#define QUEUE_HEAD_INC(__my_batch_size, __ith)                          \
   do {                                                                  \
-    assert(!(queue->num_queued_packets + my_batch_size > queue->queue_len)); \
-    queue->num_queued_packets += my_batch_size;                         \
-    queue->tail = (queue->tail + my_batch_size) & (queue->queue_len - 1); \
+    assert(!(__my_batch_size > queue->receiver_queue[__ith].num_queued_packets)); \
+    queue->receiver_queue[__ith].num_queued_packets -= __my_batch_size;       \
+    /* Unlike the tail, we have multiple receivers so we need multiple heads*/ \
+    queue->receiver_queue[__ith].head =                                       \
+      (queue->receiver_queue[__ith].head + __my_batch_size) & (queue->queue_len - 1); \
+  } while (false)
+/* for tail_inc, sender increments queue count for ALL receivers in one shot */
+#define QUEUE_TAIL_INC(__my_batch_size)                                 \
+  do {                                                                  \
+    uint32_t i;                                                         \
+    /* One tail for all revceiver because we have 1 sender */           \
+    queue->tail = (queue->tail + __my_batch_size) & (queue->queue_len - 1); \
+    for (i = 0; i < num_receivers; i++) {                               \
+      assert(!(receiver_queue[i].num_queued_packets + __my_batch_size >  \
+               queue->queue_len));                                      \
+      receiver_queue[i].num_queued_packets += __my_batch_size;         \
+    }                                                                   \
   } while (false)
 
 /* Print error in read color */
@@ -594,7 +674,7 @@ close_fds(void)
   uint32_t i;
   for (i = 0; i < num_receivers; i++) {
     if (server_accept_fd[i] > 0) {
-      close (server_accept_fd[i]);
+      close(server_accept_fd[i]);
     } else {
       if (is_transmitter) {
         PRINT_ERR("Server socket %u NOT opened\n", i);
@@ -623,12 +703,69 @@ close_fds(void)
 }
 
 
+
+static char *
+print_packet(packet_t *packet)
+{
+  static char buf[1025];
+  memset(buf, 0, sizeof(buf));
+  snprintf(buf, 1024, "seq=%u num_objs=%u",
+           packet->sequence,
+           packet->num_objs);
+  return (buf);
+}
+
+static char *
+print_queue(shm_queue_t *queue)
+{
+  static char buf[2049];
+  memset(buf, 0, sizeof(buf));
+  snprintf(buf, 2048, "len=%u tail=%u obj=%u pack_size=%u window=%u",
+           queue->queue_len,
+           queue->tail,
+           queue->obj_size,
+           queue->packet_size,
+           queue->window_size);
+  for (uint32_t i = 0; i < num_receivers; i++) {
+    snprintf(&buf[strlen(buf)], 2048 - strlen(buf),
+             "\n\t  %u: queued=%u head=%u wait_pulse=%s HW=%s",
+             i,
+             queue->receiver_queue[i].num_queued_packets,
+             queue->receiver_queue[i].head,
+             queue->receiver_queue[i].receiver_waiting_for_pulse_from_sender
+             ? "T" : "F",
+             queue->receiver_queue[i].high_water_mark_reached ? "T" : "F");
+  }
+  return(buf);
+}
+
+static char *
+print_queue_receiver(shm_queue_t *queue, uint32_t my_receiver_id)
+{
+  static char buf[2049];
+  memset(buf, 0, sizeof(buf));
+  snprintf(buf, 2048, "%u: len=%u tail=%u obj=%u pack_size=%u window=%u"
+           "\n\t  queued=%u head=%u wait_pulse=%s HW=%s",
+           my_receiver_id,
+           queue->queue_len,
+           queue->tail,
+           queue->obj_size,
+           queue->packet_size,
+           queue->window_size,
+           queue->receiver_queue[my_receiver_id].num_queued_packets,
+           queue->receiver_queue[my_receiver_id].head,
+           queue->receiver_queue[my_receiver_id].receiver_waiting_for_pulse_from_sender
+           ? "T" : "F",
+           queue->receiver_queue[my_receiver_id].high_water_mark_reached ? "T" : "F");
+  return(buf);
+}
+
 /*
  * send a single pulse to receiver
  */
-#define PULSE_RECEIVER(pulse, is_transmitter) \
+#define PULSE_RECEIVER(pulse, is_transmitter)                   \
   do {                                                          \
-  uint64_t eventfd_write = pulse;                               \
+    uint64_t eventfd_write = pulse;                                     \
   if (write(receiver_wakeup_eventfd_fd, &eventfd_write, sizeof(eventfd_write))\
       !=  sizeof(eventfd_write)) {                                      \
     PRINT_ERR("Cannot write message %zu to receiver_wakeup fd %d\n"     \
@@ -707,6 +844,42 @@ close_fds(void)
   } while (false)
 
 
+#define READ_PULSE(__use_eventfd)                       \
+do {                                                    \
+  uint64_t fd_read;                                                     \
+  rc = (int)read(event.data.fd, &fd_read,                               \
+                 __use_eventfd ? sizeof(uint64_t) : sizeof(uint8_t));    \
+  if (((__use_eventfd) ?                                                \
+       (ssize_t)rc !=  sizeof(uint64_t) :                               \
+       (ssize_t)rc !=  sizeof(uint8_t))) {                              \
+    PRINT_ERR("CANNOT read from %s %d "                                 \
+              "num_epoll_wait %u "                                      \
+              "current packet SEQUENCE %u, "                            \
+              "curr_batch_size %u head %u from %uth packet %p data %p \n" \
+              "\tSo far sender_wakeup_needed %u lost objects %u "       \
+              "lost packets %u.\n"                                      \
+              "\tSo received %d objects %u packets %u batchs\n"         \
+              "\tqueue=(%s): %d %s\n",                                  \
+              is_use_eventfd_to_pulse_receivers ?                       \
+              "receiver_wakeup_eventfd_fd" : "sock_fd",                 \
+              is_use_eventfd_to_pulse_receivers ?                       \
+              receiver_wakeup_eventfd_fd : sock_fd,                     \
+              num_epoll_wait,                                           \
+              sequence,                                                 \
+              curr_batch_size, receiver_queue->head, i, packet, data,   \
+              num_sender_wakeup_needed,                                 \
+              num_lost_objs,                                            \
+              num_lost_packets,                                         \
+              num_sent_received_objs,                                   \
+              num_packets,                                              \
+              num_batchs,                                               \
+              print_queue(queue),                                       \
+              errno, strerror(errno));                                  \
+    ret_value = EXIT_FAILURE;                                           \
+    goto out;                                                           \
+  }                                                                     \
+ } while (false);
+
 /*
  * print stats
  */
@@ -714,6 +887,8 @@ static void print_stats(void)
 {
   PRINT_INFO("\n%s Statistics:\n"
              "\tTotal Time: %lu.%06lu\n"
+             "\tAdaptive mutex = %s\n"
+             "\tnum_receivers = %u\n"
              "\tnum_batchs = %u\n"
              "\tMax batch_size = %u\n"
              "\tMax batch_size in bytes = %u\n"
@@ -726,12 +901,16 @@ static void print_stats(void)
              "\tnum_sender_wakeup_needed = %u\n"
              "\tnum_lost_objs = %u\n"
              "\tnum_pulse_myself  = %u\n"
-             "\tnum_low_water_mark_reached=%u\n"
+             "\tnum_last_receiver_reach_low_water_mark = %u\n"
+             "\tnum_non_last_receiver_reach_low_water_mark = %u\n"
+             "\tnum_sender_zero_curr_batch_size = %u\n"
              "\tSlow factor = %u\n"
              "%s %s"
-             "\tqueue = (%s)\n",
+             "\tqueue = %s\n",
              is_transmitter ? "Sender" : "Receiver",
              time_diff.tv_sec, time_diff.tv_usec,
+             is_adaptive_mutex ? "true" : "false",
+             num_receivers,
              num_batchs,
              batch_size,
              batch_size * queue->packet_size ,
@@ -746,12 +925,15 @@ static void print_stats(void)
              num_sender_wakeup_needed,
              num_lost_objs,
              num_pulse_myself,
-             num_low_water_mark_reached,
+             num_last_receiver_reach_low_water_mark,
+             num_non_last_receiver_reach_low_water_mark,
+             num_sender_zero_curr_batch_size,
              slow_factor,
              is_transmitter ? "" : "\treceiver_defer_after_each_batch = ",
              is_transmitter ? "" :
              (receiver_defer_after_each_batch ? "true\n" : "false\n"),
-             print_queue(queue));
+             is_transmitter ? 
+             print_queue(queue) : print_queue_receiver(queue, receiver_id));
 }
 
 
@@ -1065,6 +1247,8 @@ print_usage (const char *progname)
            "\t-q <queue len>. Default %u packets\n"
            "\t-l <low water mark> Default %u packets\n"
            "\t-b <batch size>, default %u\n"
+           "\t-i <receiver_ID>. Only needed when more than 1 receiver\n"
+           "\t-u Use AF_UNIX socket for singalling instead of default eventfd\n"
            "\t-o <object size>, default %u\n",
            progname,
            receiver_defer_after_each_batch ? "true" : "false",
@@ -1094,7 +1278,7 @@ main (int    argc,
   int scm_fds[2];
   int epoll_fd;
   struct epoll_event event;
-  uint32_t curr_batch_size;
+  uint32_t curr_batch_size = 0;
   int ret_value = EXIT_SUCCESS;
   /* Number of objects to pack in a packet */
   uint32_t objs_per_packet;
@@ -1107,7 +1291,7 @@ main (int    argc,
   memset(queue_name, 0, sizeof(queue_name));
   strcpy(queue_name, DEFAULT_QUEUE_NAME);
   
-  while ((opt = getopt (argc, argv, "aetdp:r:n:q:b:o:l:S:s:")) != -1) {
+  while ((opt = getopt (argc, argv, "aetdup:r:n:q:b:o:l:S:s:i:")) != -1) {
     switch (opt)
       {
       case 'a':
@@ -1164,6 +1348,17 @@ main (int    argc,
         if (num_receivers > MAX_NUM_RECEIVERS || !num_receivers) {
           PRINT_ERR("\nInvalid number of receivers %s. "
                     "Must be between 1 and %u\n", optarg, MAX_NUM_RECEIVERS);
+          exit (EXIT_FAILURE);
+        }
+        break;
+      case 'i':
+        if (1 != sscanf(optarg, "%u", &receiver_id)) {
+          PRINT_ERR("\nCannot read receiver ID %s. \n", optarg);
+          exit (EXIT_FAILURE);
+        }
+        if (receiver_id > MAX_NUM_RECEIVERS) {
+          PRINT_ERR("\nInvalid number of receivers %s. "
+                    "Must be between 0 and %u\n", optarg, MAX_NUM_RECEIVERS);
           exit (EXIT_FAILURE);
         }
         break;
@@ -1233,6 +1428,9 @@ main (int    argc,
           exit (EXIT_FAILURE);
         }
         break;
+      case 'u':
+        is_use_eventfd_to_pulse_receivers = false;
+        break;
       default: /* '?' */
         print_usage(argv[0]);
         return EXIT_FAILURE;
@@ -1245,6 +1443,40 @@ main (int    argc,
     exit (EXIT_FAILURE);
   }
 
+  if(num_receivers == 1) {
+    receiver_id = 0;
+  } else {
+    /*
+     * When I use eventfd with multiple receivers, I can see that a pulse gets
+     * lost and we fall into a deadlock after ew hundred thousands to few
+     * million objects. Hence I wll NOt use it
+     * This may very well be a bug in my code or the fact that a single write
+     * to an eventfd cannot be used reliably to wakeup multiple waiters on that
+     * same eventfd using epoll_wait()
+     */
+
+    if (is_use_eventfd_to_pulse_receivers) {
+      PRINT_ERR("eventfd CANNOT with multiple-receivers "
+                "because it is NOT RELIABLE\n");
+      exit (EXIT_FAILURE);
+    }
+    /*
+     * something occurs when there is nore than one receiver
+     * (may be a bug in this code)
+     * So I will NOT use eventfd with multiple recievers
+     */
+    if (receiver_defer_after_each_batch) {
+      PRINT_ERR("Receiver defer afer each batch does not currentluy work "
+                "with multiple-receivers\n");
+      exit (EXIT_FAILURE);
+    }
+  }
+  if (!is_transmitter && !(receiver_id < num_receivers)) {
+    PRINT_ERR("Receiver ID '%u' incorrect or NOT specififed. "
+              "MUST strictly less than number of receivers %u\n",
+              receiver_id, num_receivers);
+    exit (EXIT_FAILURE);
+  }
 
   if (!is_power_of_two(queue_len)) {
     PRINT_ERR("queue len is '%u' MUST be a power of two.\n",
@@ -1346,7 +1578,12 @@ main (int    argc,
     queue->packet_size = packet_size;
     queue->obj_size = obj_size;
     queue->window_size = window_size;
-    
+    queue->num_receivers =  num_receivers;
+    queue->is_adaptive_mutex = is_adaptive_mutex;
+    for (i = 0; i < num_receivers; i++) {
+      queue->receiver_queue[i].receiver_id = UINT32_MAX;
+    }
+
     /*
      * Init the mutex
      */
@@ -1408,7 +1645,7 @@ main (int    argc,
     packet_size = queue->packet_size;
     obj_size = queue->obj_size;
     window_size = queue->window_size;
-
+    is_adaptive_mutex = queue->is_adaptive_mutex;
     /*
      * Unmap then remap using the size obtained from reading the queue header
      */
@@ -1431,6 +1668,28 @@ main (int    argc,
                  errno, strerror(errno));
       return EXIT_FAILURE;
     }
+
+    /*
+     * Let's do some validation
+     */
+    if (num_receivers != queue->num_receivers) {
+      PRINT_ERR( "\nUser asked for num_receivers %u but sender expects %u. "
+                 "window '%s' shm_fd %d\n",
+                 num_receivers, queue->num_receivers,
+                  queue_name, shm_fd);
+      return EXIT_FAILURE;
+    }
+    if (queue->receiver_queue[receiver_id].receiver_id != UINT32_MAX) {
+      PRINT_ERR( "\nUser asked for receiver_id %u "
+                 "but is already taken by id %u. "
+                 "window '%s' shm_fd %d\n",
+                 receiver_id, queue->receiver_queue[receiver_id].receiver_id,
+                  queue_name, shm_fd);
+      return EXIT_FAILURE;
+    }
+
+    /* Record our receiver ID */
+    queue->receiver_queue[receiver_id].receiver_id = receiver_id;
   }
 
   /* Number of objects to pack/unpack into/from a packet */
@@ -1596,8 +1855,8 @@ main (int    argc,
         exit(EXIT_FAILURE);
       }
 
-      PRINT_DEBUG("Connected to receiver %d accept_fd %d , len %d path '%s'.\n",
-                  i, server_accept_fd[i],remote_len, sockaddr_remote.sun_path);
+      PRINT_INFO("Connected to receiver %d accept_fd %d  waiting for %u.\n",
+                 i, server_accept_fd[i], num_receivers - (i + 1));
       /*
        * Send the SCM_RIGHTS message containing the eventfd
        */
@@ -1610,7 +1869,7 @@ main (int    argc,
       }
     }
     PRINT_INFO("Connected to %u receivers..\n\n",num_receivers);
-    
+
     /*
      * prepare the epoll for sender so that we can wait on it if we find that
      * the queue is full
@@ -1716,12 +1975,48 @@ main (int    argc,
    * If I am a transmitter, let me go through the transmission loop
    */
   if (is_transmitter) {
+    bool is_pulse_receiver;
+    /* For the transmitter, we will be working on all receivers */
+    shm_receiver_queue_t *receiver_queue =  &queue->receiver_queue[0];
+    
+    /*
+     * Let's send initial pulse over the AF_UNIX socket to allow recievers to
+     * almost take the initial timestamp at the same time
+     */
+    PRINT_INFO("Going to send synchronization pulse to %u receivers\n",
+               num_receivers);
+    if (is_use_eventfd_to_pulse_receivers) {
+      PULSE_RECEIVER(num_receivers, is_transmitter);
+    } else {
+      for (i = 0; i < num_receivers; i++) {
+        uint8_t pulse = 1;
+        rc = write(server_accept_fd[i], &pulse, sizeof(pulse));
+        if (!rc) {
+          PRINT_ERR("Cannot send initial pulse to receiver %u accept_fd %d "
+                    "queue= (%s): "
+                    "%d %s\n",
+                    i,
+                    server_accept_fd[i],
+                    print_queue(queue),
+                    errno, strerror(errno));
+          ret_value = EXIT_FAILURE;
+          goto out;
+        } else {
+          PRINT_DEBUG("Successfully sent Synchronization pulse to receiver %u\n", i);
+          receiver_queue[i].receiver_waiting_for_pulse_from_sender = false;
+        }
+      }
+    }
+      
+    
     /* get time stamp when starting to send */
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
 
     uint32_t sequence = 0;
     while (num_objs > num_sent_received_objs) {
-      
+      /* No receiver needs pulsing unless we know that */
+      is_pulse_receiver = false;
+
       /*Init batch size to what user wants */
       curr_batch_size = batch_size;
 
@@ -1733,25 +2028,29 @@ main (int    argc,
         objs_per_packet = num_objs - num_sent_received_objs;
       }
       /*** Lock the queue ***/
-      QUEUE_LOCK;      
-      /*
-       * If queue lenght is zero, then we have to wakeup the reveiver(s)
-       */
-      bool is_pulse_receiver = queue->num_queued_packets ? false : true;
-
-
-      /*
-       * If the batch size is greater than the empty queue space, then
-       * reduce the batch size to the remaining number of packets
-       * It possible that while we are queueing these packets that the
-       * receiver will dequeue some packets and hence the remaining queue
-       * length will increas. So after sending the adjusted batch, we will
-       * check to see if the queue is still full
-       * However we do NOT want to lock/unlock the queue after every packet to
-       * check if it is possible to increas the batch size
-       */
-      if (curr_batch_size > queue->queue_len - queue->num_queued_packets) {
-        curr_batch_size = queue->queue_len - queue->num_queued_packets;
+      QUEUE_LOCK;
+      for (i = 0; i < num_receivers; i++) {
+        /*
+         * If a queue length is zero, then we have to wakeup that receiver
+         */
+        if (!receiver_queue[i].num_queued_packets) {
+          is_pulse_receiver = true;
+        }
+        /*
+         * If the batch size is greater than the empty queue space, then
+         * reduce the batch size to the remaining number of packets
+         * It possible that while we are queueing these packets that the
+         * receiver will dequeue some packets and hence the remaining queue
+         * length will increas. So after sending the adjusted batch, we will
+         * check to see if the queue is still full
+         * However we do NOT want to lock/unlock the queue after every packet to
+         * check if it is possible to increas the batch size
+         */
+        if (curr_batch_size >
+            queue->queue_len - receiver_queue[i].num_queued_packets) {
+          curr_batch_size =
+            queue->queue_len - receiver_queue->num_queued_packets;
+        }
       }
         /*** Unlock the queue ***/
       QUEUE_UNLOCK;
@@ -1768,7 +2067,7 @@ main (int    argc,
       }
 
       /*
-       * NOw let's queuee one batch of packets
+       * NOw let's queue one batch of packets
        * we already adjusted the current batch size for queue
        */
       for (i = 0; i < (uint32_t)curr_batch_size; i++) {
@@ -1794,15 +2093,19 @@ main (int    argc,
           obj->counter++;
           data = (uint8_t *)((uintptr_t)(data) + (uintptr_t)obj_size);
           num_sent_received_objs++; /* inc number of packed objects */
-        }
+        } /* for (j = 0; j < objs_per_packet; j++) */
         /* record objects packed in packet */
         packet->num_objs = objs_per_packet ;
         /* Inc number of packed packets */
         num_packets++; 
         sequence++; /* Inc sequence number of packets */
+      } /* for (i = 0; i < (uint32_t)curr_batch_size; i++)*/
+      /* Inc number of queued batchs */
+      if (curr_batch_size) {
+        num_batchs++;
+      } else {
+        num_sender_zero_curr_batch_size++;
       }
-       /* Inc number of queued batchs */
-      num_batchs =  curr_batch_size ? num_batchs + 1 : num_batchs;
 
       /* 
        * advance the tail and the number of queued packets by the batch size 
@@ -1814,10 +2117,10 @@ main (int    argc,
        * Consider the following scenario that would lead to a deadlock
        * - The receiver drained all packets in the queue hence it will be
        *   waiting for the sender's pulse
-       *   REMEMBER that while draining packets, the receiver does NOT lock the
-       *           queue mutex
-       *            Instead it will wait till it dequeues a batch, then lock
-       *            the queue mutex and update the "head" and "num_queued_packets"
+       *   REMEMBER that
+       *     while draining packets, the receiver does NOT lock the queue mutex
+       *     Instead it will wait till it dequeues a batch, then lock
+       *     the queue mutex and update the "head" and "num_queued_packets"
        * - The sender is queueing packets into the queue
        *   REMEMBER also that while queueing packets, the sender does NOT lock 
        *            the queue mutex
@@ -1826,7 +2129,7 @@ main (int    argc,
        * - Even though the receiver locks the mutex when it checks whether the
        *   sender reached the high water mark, because the sender updates the
        *   queue after it finishes queueing, it is possible that the receiver
-       *   sees that thew sender did NOT reach the high water mark even though
+       *   sees that the sender did NOT reach the high water mark even though
        *   the sender has actually reached the high water mark
        * - Hence by the time the sender locks the mutex and decides that it has
        *   reached the high water mark, the sender would have thought that the
@@ -1836,40 +2139,106 @@ main (int    argc,
        * - Hence to be on the safe side, the sender will always pulse the
        *   receiver when it reaches the high water mark
        */
+      bool is_sender_wakeup_needed = false;
       QUEUE_LOCK;
+      /* Increment for all receivers in one shot because we have 1 tail */
       QUEUE_TAIL_INC(curr_batch_size);
-      PRINT_DEBUG("***ADVANCED TAIL by curr_batch %u object counter %u %uth "
-                  "packet sequence %u tail %u, "
-                  "from data %p packet %p\n"
-                  "\tSo far sender_wakeup_needed %u lost objects %u.\n"
-                  "\tSo sent %d objects %u packets %u batchs\n"
-                  "\tqueue=(%s)\n",
-                  curr_batch_size,
-                  obj->counter, i, packet->sequence, queue->tail, data, packet,
-                  num_sender_wakeup_needed,
-                  num_lost_objs,
-                  num_sent_received_objs,
-                  num_packets,
-                  num_batchs,
-                  print_queue(queue));
-      
-      if (queue->queue_len == queue->num_queued_packets) {
-        queue->high_water_mark_reached = true;
-        /* As mentiokned above, we will wakeup receiver to avoid possible
-           deadlock */
-        if (queue->receiver_waiting_for_pulse_from_sender) {
-          is_pulse_receiver = true;
-          /* Clear the need for pulse receiver because we will send it within
-             the next few instructions */
-          queue->receiver_waiting_for_pulse_from_sender = false;
+      /* check if we need to pulse any receiver to avoid possible deadlock as
+         mentioned above */
+      for (i = 0; i < num_receivers; i++) {
+        /* Advance each receive tail and queue_len*/
+        PRINT_DEBUG("***ADVANCED %uth TAIL by curr_batch %u object counter %u "
+                    "last sequence %u tail %u, "
+                    "from data %p packet %p\n"
+                    "\tSo far sender_wakeup_needed %u lost objects %u.\n"
+                    "\tSo sent %d objects %u packets %u batchs\n"
+                    "\tqueue=(%s)\n",
+                    i,
+                    curr_batch_size,
+                    obj->counter, packet->sequence, queue->tail, data,
+                    packet,
+                    num_sender_wakeup_needed,
+                    num_lost_objs,
+                    num_sent_received_objs,
+                    num_packets,
+                    num_batchs,
+                    print_queue(queue));
+        
+        if (queue->queue_len ==
+            receiver_queue[i].num_queued_packets) {
+          receiver_queue[i].high_water_mark_reached = true;
+          is_sender_wakeup_needed = true;
+          /* As mentioned above, we will wakeup receiver to avoid possible
+             deadlock */
+          if (receiver_queue[i].receiver_waiting_for_pulse_from_sender) {
+            is_pulse_receiver = true;
+            /* Clear the need for pulse receiver because we will send it within
+               the next few instructions */
+            if (is_use_eventfd_to_pulse_receivers) {
+              receiver_queue[i].receiver_waiting_for_pulse_from_sender = false;
+            }
+          }
         }
-        /* Inc number of times sender will block until receiver drains queue
-           because of re3aching high water mark*/
-        num_sender_wakeup_needed++;
-        QUEUE_UNLOCK;
+      } /*  for (i = 0; i < num_receivers; i++) */
+      QUEUE_UNLOCK;
+
+      /* Send pulse if at least one receiver needs to be waken up 
+       * We want to do that BEFORE we check if we have reached high water
+       * because if at least one receiver reached high water mark we will block
+       * and we want to make sure that all receviers are unlbockied to be able
+       * to unblock the sender out 
+       */
+      if(is_pulse_receiver) {
+        if (is_use_eventfd_to_pulse_receivers) {
+          PULSE_RECEIVER(num_receivers, is_transmitter);
+        } else {
+          uint8_t pulse = 1;
+          for (i = 0; i < num_receivers; i++) {
+            rc = write(server_accept_fd[i], &pulse, sizeof(pulse));
+            if (!rc) {
+              PRINT_ERR("Cannot send pulse to receiver %u accept_fd %d "
+                        "curr_batch siz %u "
+                        "last sequence %u tail %u, "
+                        "\tSo far sender_wakeup_needed %u lost objects %u.\n"
+                        "\tSo sent %d objects %u packets %u batchs\n"
+                        "\tqueue= (%s): "
+                        "%d %s\n",
+                        i,
+                        server_accept_fd[i],
+                        curr_batch_size,
+                        sequence, queue->tail,
+                        num_sender_wakeup_needed,
+                        num_lost_objs,
+                        num_sent_received_objs,
+                        num_packets,
+                        num_batchs,
+                        print_queue(queue),
+                        errno, strerror(errno));
+              ret_value = EXIT_FAILURE;
+              goto out;
+            } else {
+              PRINT_DEBUG("Successfully pulsed receiver %u\n", i);
+              receiver_queue[i].receiver_waiting_for_pulse_from_sender = false;
+            }
+          }
+        }
+        is_pulse_receiver = false; /* NO need anymore because I just
+                                      pulsed all receiver(s)*/
+      }
+
+      /*
+       * If at least the queue of one of the receivers has reached high water
+       * mark, we have to block until that receiver (or other receiver) wakes
+       * us up */
+      if (is_sender_wakeup_needed) {
+        /* If sender reached high water mark for at least one receiver, Inc
+         * number of times sender will block until receiver drains queue
+         * because of reaching high water mark */
+        num_sender_wakeup_needed ++;
+
         PRINT_DEBUG("Going to wait on sender_wakeup fd %d,\n "
-                    "\tSo far sender_wakeup_needed %u.\n"
-                    "\tSo far sent %d objects %u packets %u batches batch size %d\n"
+                  "\tSo far sender_wakeup_needed %u.\n"
+                   "\tSo far sent %d objects %u packets %u batches batch size %d\n"
                     "\tqueue=(%s)\n",
                     sender_wakeup_eventfd_fd,
                     num_sender_wakeup_needed,
@@ -1878,12 +2247,8 @@ main (int    argc,
                     num_batchs,
                     curr_batch_size,
                     print_queue(queue));
-        if(is_pulse_receiver) {
-           is_pulse_receiver = false; /* NO need anymore because I just
-                                        pulsed receiver*/
-           PULSE_RECEIVER(num_receivers, is_transmitter);
-        }
-        /* wait */
+
+        /* wait for some receiver to wake us up */
         rc = epoll_wait(epoll_fd, &event, 1, -1);
         if (rc < 0) {
           PRINT_ERR("epoll_wait failed for epoll_fd %d sender_evenfd %d "
@@ -1895,14 +2260,13 @@ main (int    argc,
           PRINT_DEBUG("Successfully came out of epoll_wait epoll_fd=%d "
                       "sender_evenfd %d queue=(%s)\n",
                       epoll_fd, sender_wakeup_eventfd_fd,
-                    print_queue(queue));
+                      print_queue(queue));
           /* the eventfd are ruinning in semaphore moddde. Hence we have read to
            * decrement, otherrrwise we will continue to be waken up */
           uint64_t eventfd_read;
           read(sender_wakeup_eventfd_fd, &eventfd_read, sizeof(eventfd_read));
         }
       } else {
-        QUEUE_UNLOCK;
         PRINT_DEBUG("NO NEED for sender_wakeup fd %d,\n "
                     "\tSo far sender_wakeup_needed %u.\n"
                     "\tSo far sent %d objects %u packets %u batches batch size %d\n"
@@ -1914,12 +2278,6 @@ main (int    argc,
                     num_batchs,
                     curr_batch_size,
                     print_queue(queue));
-      }
-      /* Pulse the receiver if queue was empty when we started this batch OR
-         we have reached the high water mark AND the receiver said it will
-         wait on epoll_wait() for a pulse from the sender */
-      if (is_pulse_receiver) {
-        PULSE_RECEIVER(num_receivers, is_transmitter);
       }
       /* Slow ourselves if we requested */
       for (i = 0; i < slow_factor; i++) {
@@ -1939,40 +2297,74 @@ main (int    argc,
    * If I am a receiver I wil go through the receiving loop
    */
   if (!is_transmitter) {
-    /* get time stamp when start receiving */
-    clock_gettime(CLOCK_MONOTONIC, &start_ts);
-    
-
     uint32_t counter = 0;
     uint32_t sequence = 0;
     bool pulse_myself = false;
     bool sender_exited = false;
     uint32_t num_epoll_wait = 0; /* Number of times we waited in epoll_wait */
+    int sender_exited_fd = -1; /* Sender's FD when we get EPOLLRDHUP */
+    /* For a receiver, we will be working on the head and queue_len of that
+       PARTICULAR receiver only except in one or two cases */
+    shm_receiver_queue_t *receiver_queue = &queue->receiver_queue[receiver_id];
+
+
+    /*
+     * Wait for the synchronization pulse before taking the time stamp
+     */
+    rc = epoll_wait(epoll_fd, &event, 1, -1);
+    if (rc < 0) {
+      PRINT_ERR("Initial pulse epoll_wait failed for epoll_fd %d "
+                "received_evenfd %d"
+                "\tqueue=(%s): %d %s\n",
+                epoll_fd,  receiver_wakeup_eventfd_fd,
+                print_queue(queue), errno, strerror(errno));
+      ret_value = EXIT_FAILURE;
+      goto out;
+    }
+    /*
+     * If we got EPOLLRDHUP, then the sender has exited. So we will exit
+     */
+    if (event.events & EPOLLRDHUP) {
+      PRINT_INFO("Receiver %u exitted PREMATURELY\n", receiver_id);
+      ret_value = EXIT_SUCCESS;
+      goto out;
+    }
+
+    /* read the pulse that woke us up */
+    READ_PULSE(is_use_eventfd_to_pulse_receivers);
+
+    PRINT_INFO("Receiver %u received synchronization pulse\n", receiver_id);
+
+    /* get time stamp when start receiving */
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+
     PRINT_DEBUG("Going to call epoll_wait() on epoll_fd=%d for evenfd %d. \n",
                 epoll_fd, receiver_wakeup_eventfd_fd);
     QUEUE_LOCK;
-    queue->receiver_waiting_for_pulse_from_sender = true;
+    receiver_queue->receiver_waiting_for_pulse_from_sender = true;
     QUEUE_UNLOCK;    
     while((rc = epoll_wait(epoll_fd, &event, 1, -1)) > 0) {
       num_epoll_wait++;
 
       PRINT_DEBUG("Came out of epoll_wait %u times epoll_fd=%d "
-                  "receiver_wakeup_evenfd %d queue=(%s)\n",
+                  "receiver_wakeup_evenfd %d num_epoll_wait %u queue=(%s)\n",
                   num_epoll_wait,
                   epoll_fd, receiver_wakeup_eventfd_fd,
+                  num_epoll_wait,
                     print_queue(queue));
       /*
        * If we got EPOLLRDHUP, then the sender has exited. So we will exit
        */
       if (event.events & EPOLLRDHUP) {        
         sender_exited = true;
+        sender_exited_fd =  event.data.fd;
+      } else {
+        /* the receive_wakeup_eventfd_fd is running in semaphore moddde. Hence
+         * we have read to decrement, otherrrwise we will continue to be waken
+         * up */
+        READ_PULSE(is_use_eventfd_to_pulse_receivers);
       }
-        
-      
-      /* the receive_wakeup_eventfd_fd is running in semaphore moddde. Hence we
-       * have read to decrement, otherrrwise we will continue to be waken up */
-      uint64_t eventfd_read;
-      read(receiver_wakeup_eventfd_fd, &eventfd_read, sizeof( eventfd_read));
+    
 
       /* User have to option to continue instead of pulsing ourself */
     begin_receive_loop:
@@ -1988,8 +2380,8 @@ main (int    argc,
        * size of zero
        */
       curr_batch_size = batch_size;
-      if (queue->num_queued_packets < curr_batch_size) {
-        curr_batch_size = queue->num_queued_packets;
+      if (receiver_queue->num_queued_packets < curr_batch_size) {
+        curr_batch_size = receiver_queue->num_queued_packets;
       }
       QUEUE_UNLOCK;
 
@@ -1998,7 +2390,7 @@ main (int    argc,
        */
       for (i = 0; i < (uint32_t)curr_batch_size; i++) {
         packet =
-          (packet_t *)&queue->packets[((queue->head + i) & (queue->queue_len - 1)) * (uint32_t)queue->packet_size];
+          (packet_t *)&queue->packets[((receiver_queue->head + i) & (queue->queue_len - 1)) * (uint32_t)queue->packet_size];
         data = &packet->data[0];
         if (packet->sequence != sequence) {
           num_lost_packets++;
@@ -2008,7 +2400,7 @@ main (int    argc,
                     "\tSo received %d objects %u packets %u batchs\n"
                     "\tqueue=(%s)\n",
                     packet->sequence, sequence,
-                    curr_batch_size, queue->head, i, packet, data,
+                    curr_batch_size, receiver_queue->head, i, packet, data,
                     num_sender_wakeup_needed,
                     num_lost_objs,
                     num_lost_packets,
@@ -2058,19 +2450,21 @@ main (int    argc,
             goto out;
             /*exit(EXIT_FAILURE);*/
           } else {
-            PRINT_DEBUG("***Recevied object counter %u (%u), expecting %u "
-                      "%uth packet sequence %u at head %u from data %p \n"
-                      "\tSo far sender_wakeup_needed %u lost objects %u.\n"
-                      "\tSo received %d objects %u packets %u batchs\n"
-                      "\tqueue=(%s)\n",
-                        obj->counter, ((obj_t *)data)->counter, counter, i, packet->sequence,
-                        queue->head, data,
-                      num_sender_wakeup_needed,
-                      num_lost_objs,
-                      num_sent_received_objs,
-                      num_packets,
-                      num_batchs,
-                      print_queue(queue));
+            PRINT_DEBUG("***ID %u Recevied object counter %u, expecting %u "
+                        "%uth packet sequence %u at head %u from data %p \n"
+                        "\tSo far sender_wakeup_needed %u lost objects %u.\n"
+                        "\tSo received %d objects %u packets %u batchs\n"
+                        "\tqueue=(%s)\n",
+                        receiver_id,
+                        obj->counter,
+                        counter, i, packet->sequence,
+                        receiver_queue->head, data,
+                        num_sender_wakeup_needed,
+                        num_lost_objs,
+                        num_sent_received_objs,
+                        num_packets,
+                        num_batchs,
+                        print_queue(queue));
             counter++;
           }
           data = (uint8_t *)((uintptr_t)(data) + (uintptr_t)obj_size);  
@@ -2078,40 +2472,41 @@ main (int    argc,
         }
         num_packets++; /* Inc number of packed packets */
         sequence++; /* Inc expected packet sequence number */
-      }
+      } /* for (i = 0; i < (uint32_t)curr_batch_size; i++) { */
       /* Inc number of queued batchs */
       num_batchs = curr_batch_size ? num_batchs + 1 : num_batchs; 
 
       
       QUEUE_LOCK;
       /* Update the queue after dequeueing an entire batch */
-      QUEUE_HEAD_INC(curr_batch_size);
+      QUEUE_HEAD_INC(curr_batch_size, receiver_id);
       PRINT_DEBUG("***ADVANCED HEAD by curr_batch %u object counter %u %uth packet sequence %u tail %u, "
-                      "from data %p packet %p\n"
-                      "\tSo far sender_wakeup_needed %u lost objects %u.\n"
-                      "\tSo sent %d objects %u packets %u batchs\n"
-                      "\tqueue=(%s)\n",
+                  "from data %p packet %p\n"
+                  "\tSo far sender_wakeup_needed %u lost objects %u.\n"
+                  "\tSo sent %d objects %u packets %u batchs\n"
+                  "\tqueue=(%s)\n",
                       curr_batch_size,
-                      obj->counter, i, packet->sequence, queue->tail, data, packet,
-                      num_sender_wakeup_needed,
-                      num_lost_objs,
-                      num_sent_received_objs,
-                      num_packets,
-                      num_batchs,
-                      print_queue(queue));
+                  obj->counter, i,
+                  packet->sequence, queue->tail, data, packet,
+                  num_sender_wakeup_needed,
+                  num_lost_objs,
+                  num_sent_received_objs,
+                  num_packets,
+                  num_batchs,
+                  print_queue(queue));
       /*
        * If there are still some packets in the queue, then we need to pulse
        * ourselves so that we wakeup and continue receiving the data
        */
-      pulse_myself = !!(queue->num_queued_packets);
+      pulse_myself = !!(receiver_queue->num_queued_packets);
 
       /*
        * If I am NOT going to pulse myself then this means that the queue is
        * empty and hence  I will need a wakeup pulse from the sender
        */
-      queue->receiver_waiting_for_pulse_from_sender = !pulse_myself;
+      receiver_queue->receiver_waiting_for_pulse_from_sender = !pulse_myself;
       num_receiver_wakeup_needed +=
-        queue->receiver_waiting_for_pulse_from_sender;
+        receiver_queue->receiver_waiting_for_pulse_from_sender;
 
       /*
        * If, before, while, or after we draining this batch, sender exceeded
@@ -2119,7 +2514,7 @@ main (int    argc,
        * draining this batch, then pulse the sender Otherwise do NOT pulse the
        * sender
        */
-      if (queue->high_water_mark_reached) {
+      if (receiver_queue->high_water_mark_reached) {
         /*
          * NOTE: V.I.
          * Why it may be SAFE to unlock the queue BEFORE we check whether we
@@ -2138,7 +2533,7 @@ main (int    argc,
          *     up the queue to below low water mark 
          *   - HEnce that other thread and the other threads may have already
          *     pulsed the sender
-         *   - Hence the sender may have already waken up and started queuing
+         *   - Hence the sender may have already wakenfd, up and started queuing
          *     packets and hence modifuying queue->num_queued_packet
          *   - Because we are not 100% sure that checking  an integer is an
          *     atomic operation, then we will lock the mutex to be on the safe side
@@ -2146,20 +2541,40 @@ main (int    argc,
          *     sender may have already queued enough packets to fill up the
          *     queue an d hence rasing it back ab ove the low water mark
          */
-        if (queue->num_queued_packets < low_water_mark) {
-          num_low_water_mark_reached++;
-          /* no longer in high water mark state*/
-          queue->high_water_mark_reached = false;
+        if (receiver_queue->num_queued_packets < low_water_mark) {
+          /* no longer in high water mark state as the queue len for this
+             receiover went down */
+          receiver_queue->high_water_mark_reached = false;
+          /*
+           * If we are the last receiver reaching the high water mark then
+           * going below the low water mark, then we will pulse the
+           * receiver.
+           * Otherwise we will NOT pulse it because the last one will
+           */
+          bool is_last_receiver_reach_low_water_mark = true;
+          for (i = 0; i < num_receivers; i++) {
+            if (queue->receiver_queue[i].high_water_mark_reached) {
+              is_last_receiver_reach_low_water_mark = false;
+              break;
+            }
+          }
           /* Unlock AFTER we check if we went below the low water mark */
           QUEUE_UNLOCK;
-          /* Wakeup the sender, which is waiting until queue is below water mark*/
-          PULSE_SENDER;
+          /* Wakeup the sender, which is waiting until queue is below water
+             mark*/
+          if (is_last_receiver_reach_low_water_mark) {
+            PULSE_SENDER;
+            num_last_receiver_reach_low_water_mark++;
+          } else {
+            num_non_last_receiver_reach_low_water_mark++;
+          }
         } else {
           /* Unlock AFTER we check if we went below the low water mark */
           QUEUE_UNLOCK;
         } 
       } else {
-        /* Sender did not go into high water mark node. Just unlock queue */
+        /* Queue for this receiver did NOT into high water mark node. Just
+           unlock queue */
         QUEUE_UNLOCK;
       }
       
@@ -2190,12 +2605,6 @@ main (int    argc,
            * means the queue is empty. 
            * Hence we will also exit
            */
-          PRINT_INFO("Sender EPOLLRDHUP on fd=%u "
-                    "epoll_fd=%d  after epoll_wait %u times\n\t  queue=(%s)\n\n",
-                    num_epoll_wait,
-                    event.data.fd,
-                    epoll_fd, 
-                    print_queue(queue));
           break;
         } else {
           PRINT_DEBUG("NO NEED to  pulse myself (receiver_wakeup fd %d).\n "
@@ -2222,11 +2631,21 @@ main (int    argc,
                 "\tqueue=(%s): %d %s\n",
                 epoll_fd,  receiver_wakeup_eventfd_fd,
                 print_queue(queue), errno, strerror(errno));
-      exit(EXIT_FAILURE);
+      ret_value = EXIT_FAILURE;
+      goto out;
     }
     /* get time stamp when finish receiving */
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
 
+    /* Inform the user */
+    if (sender_exited) {
+      PRINT_INFO("Sender EPOLLRDHUP on fd=%u "
+                 "epoll_fd=%d  after epoll_wait %u times\n\t  queue=(%s)\n\n",
+                 sender_exited_fd,
+                 epoll_fd,
+                 num_epoll_wait,
+                 print_queue(queue));
+    }
   }
 
   /*
@@ -2237,20 +2656,15 @@ main (int    argc,
   timersub(&end_tv, &start_tv, &time_diff);
 
 
-  /* PRINT_INFO( "Going sleep 2 seconds then unlink '%s'\n"
-              "\tTransmitter socket %d\n"
-              "\tNumber of Receivers  %d\n"
-              "\tqueue=(%s)\n\n",
-              sock_path,
-              sock_fd,
-              num_receivers,
-              print_queue(queue));
-  
-   Sleep 2 seconds to make sure that receiver drains all packets BEFORE
-   * Getting a HUP event from the epoll_wait() */
-  /*if (is_transmitter) {
-    sleep(2);
-    }*/
+  /*
+   * NOTE:
+   * there is NO NEED for the sender to sleep
+   * When a recevier gets EPOLLHUP on the AF_UNIX socket becayuse the sender
+   * has transmitted all packets and exitted, the receiver will drain all
+   * remaining packets in the queue and then exit
+   * Hence all packets are delivered to all receivers correctly
+   */
+
  out:
   print_stats();
 
