@@ -19,23 +19,27 @@
  *
  * What is this
  * ============
- * Point to multipoint shared memory queue comparison with 2 other IPC
- * mechanisms 
- * - AF_UNIX socket
- * - TCP socket
+ * Point to multipoint shared memory queue
  * Parameters
  *   queue_name: default value "shm_queue"
- *   packet_size: Size of a single buffer in the circular ring. default value is
+ *   packet_size: Size of a single packet in the circular ring. default value is
  *             1024 bytes 
- *   queue_len: number of buffers in the circular buffer. Default is 128
+ *   queue_len: number of packets in the circular buffer. Default is 128
  *   num_receivers: default is 1
  *   batch_size: 
- *   - Sender: The number of packets to send before advancincg the tail of the
- *     queue AND incrementing the number of queued packets and signaling the
- *     receiver 
-       (Receiver is signaled only if queue was empty when this batch started)
- *   - REceiver: Number of packets to dequeue before stopping and doing two
- *     things
+ *   - Sender: The maximum number of packets to send before advancincg the tail
+ *      of the queue AND incrementing the number of queued packets and signaling
+ *      the receiver (s)
+ *      (Receiver(s) is/are signaled only if queue was empty when this batch 
+ *       started)
+ *      The actual batch size is the minimum of 
+ *       - The maximum batch as specified by the user
+ *       - The minum number of packets to accomodate the remaining number of
+ *         objects still NOT sent
+ *       - The remaining slots in the queue. i.e. 
+ *         queue_len - number of queued packets
+ *   - Receiver: Maximum number of packets to dequeue before stopping and
+ *     doing two things
  *     (1) advancing "head" and decrementing number of queued packets
  *     (2) if sender reached high water mark , check if queued packets went
  *         below low water mark. If so, pulse sender
@@ -44,11 +48,14 @@
  *         This step emulates the case wqhere the receiver has to do other
  *         things other than dequeueing packets and processing objects. 
  *         Ie.e defer dequeueing packets and processing incoming objects
+ *       The actual batch at the receiver is the minimum of 
+ *         - The maximum batch as specified by the user
+ *         - The number of queued packets
  *   num_objs: Number of objects to transmit. Default is 2^20
  *   obj_size: The size of each data item to be sent by transmitter and
  *             received by receiver. default is 16
- * The queue is just a single shared memory file consisting of "num_objs" slots
- * each of size "obj_size"
+ * The queue is just a single shared memory file consisting of "queue_len" slots
+ * each of size "packet_size"
 
  * After building, Execute
  *    <binary_name> -h
@@ -59,8 +66,8 @@
  * Use
  *    gcc -o shm_queue shm_queue.c -lrt -pthread -Wall -Wextra
  *
- * How to use
- * ----------
+ * How to use for single receiver
+ * --------------------------------
  * - Start the transmitter by doing
  *     <binary_name> -t
  *   The transmitter will first delete any existing shared memory queue and
@@ -71,6 +78,26 @@
  * - Transmission and testing will start when all receivers have started and
  *   connected to the transmitter
  *
+ * example of single receiver use
+ * -----------------------------
+ * sender
+ *   ./shm_queue -t -n 1000000000 -p 50000 -b 2 -o 50 -a
+ * -t to indicate that this is the transmitter
+ * -n 1000000000 : 1 billion objects
+ * -p 50000; Each packet is 50,000 bytes
+ * -b 2: A batch of 2 packets is sent at a time
+ * -a : (optional) Use non-standard adaptive mutex
+ * 
+ * Receiver
+ *  /shm_queue -n 1000000000 -p 50000 -b 2 -o 50
+ * The argments have the same semantics as the sender
+ * -b the batch size may be DIFFERENT from the sender
+ * -p is IGNORED and the size of the packet as specified by the sender is
+ *      used 
+ * -o <obj_size> MUST be identical to the one used by the sender
+ * -n is ignored. The receiver will exit when the sender exits or with ^C is
+ *    pressed 
+ *   
  * How to use for multiple receivers,
  * ------------------------
  * - On the sender use "-r <n> -u" to specify "n" receiver and the the use of
@@ -101,49 +128,32 @@
  *   ./shm_queue -n 1000000000 -p 50000 -b 2 -o 50 -r3 -i2 -u
  *
  *
- * How SINGLE RECEIVER works
- * =========================
+ * How the shared memory queue works for SINGLE RECEIVER
+ * ========================================================
  * - The sender creates the shared memory queue
  * - THe sender maintains one array of file descriptors
  *   - server_accept_fd: THe file descriptors returned by "accept()"
  *     This is the socket used to transmit the eventfd file descriptor to the
  *     receiver 
  * - The transmitter creates two eventfd() filedescriptors
- *   - sender_wakeup_eventfd_fd: fd used by the last receiver to
- *     dequeue high water buffers to signal the   transmitter when the
- *     transmitter blocks  because the window is full  
+ *   - sender_wakeup_eventfd_fd: fd used by the receiver to
+ *     signal the   transmitter when the transmitter blocks  because the window
+ *     is full   
+ *     
  *   - receiver_wakeup_eventfd_fd: fd used by transmitter to signal receivers
  *     when the transmitter sees that the queue is empty when it starts
  *     queueing a batch of packets
- * - Both file descriptors are sent to each receiver when the receiver connects
- *   using an SCM_RIGHTS ancillary message
- * - The receiver does the following
- *   - Connects to the server AF_UNIX socket
- *   - Waits until it receives the two eventfd file descriptors over an
- *     SCM_RIGHTS ancillary message
- *   - If we are comparing with socket other that AF_UNIX
- *     - Closes the AF_unix SOCKET
- *     - waits 1 ssecond to make sure that the transmitter is waiting on 
- *       the IPC socket 
- *     - connects to the IPC socket
- *   - Otherwise (we are comparing against AF_UNIX socket
- *     It justuses the AF_UNIX socket that was used to receive the SCM_RIGHTS
- *     ancillary message containing the eventfd file descriptors
- * The server does the following
- * - Creates the two eventfd file descriptors
- * - Creates the AF_UNIX to send the eventfd file descriptors
- * - Loops for the number of receivers
+ *   - Both file descriptors are sent to each receiver when the receiver
+ *     connects using an SCM_RIGHTS ancillary message
  *   - waits on AF_UNIX with accept() 
- *   - when a receiver connects,
- *   - sends the two eventfd FDs using SCM_RIGHTS messages
- *   - If we are3 comapring something else other that AF_UNIX
- *     - Waity on the IPC FD using accept
- *     - When the receiver connects, store the FD returned by accept in the
- *       array fd_receiver_ipc_array
- *   - else 
- *      - store the FD returned by accept() on the AF_UNIX socket in the array
- *        fd_receiver_ipc_array 
- * - Start the test
+ * - The receiver Connects to the server AF_UNIX socket
+ * - When a receiver connects to sender over the AF_UNIX socket, the sender 
+ *   sends the two eventfd FDs using SCM_RIGHTS ancillary messages
+ * - When the eceiver receives the ancillary message containing the two eventfd
+ *   file descriptors, the receiever waits on receiver_wakeup_eventfd_fd" for a
+ *   signal from the sender  after the sender queues the first batch 
+ * - NOw the sender loops to send the default number of objects or the number
+ *   specified by the user when using "-n" option. 
  * 
  * How the transmitter sends objects to the SINGLE receiver
  * ==================================================================
@@ -154,7 +164,7 @@
  * 3. else
  *    3.1 pulse receiver = false
  * 4. curr_batch_size =
- *      min(queue_len - number_queued_packets, remaining_objects/obj_per_packet)
+ *      min(max_batch_size, queue_len - number_queued_packets, remaining_objects/obj_per_packet)
  * 5. Unlock(eueu->mutex>
  * 6. queue one batch  as follows
  *    for (i = 0; i < batch_size; i++) {
@@ -186,7 +196,7 @@
  *        4.1.1 high_water_mark_reached = false;
  *    3.3 endif
  * 4. endif 
- * 4.5 curr_batch_size = min(batch_size, queue->num_queued_packets)
+ * 4.5 curr_batch_size = min(max_batch_size, queue->num_queued_packets)
  * 5. unlock(queue->mutex)
  * 6. Dequeue one batch  as follows
  *    for (i = 0; i < min(batch_size, queue->num_queued_packets); i++) {
@@ -199,26 +209,28 @@
  * 9. queue->head = (queue->head + curr_batch_size)
  *                   % queue->queue_len
  * 10. queue->num_queued_packets -= curr_batch_size
- * 11. unlock(queue->mutex) 
- * 12. If (queue->num_queued_packets == 0) {
- *      high_water_mark_reached = false
- *      (of course we are out of high water mark)
- *      goto line 1
- *       (no more items in the queue, wait on receiver_wakeup_eventfd_fd,
- *        which will come when sender queues one or more packets)
- * 13. else
- *       Still some items in the queue. So we have to pulse ourselves
- *       got back to step 1
- *       
- *       * If we have reached the high water mark, see if we went lower than the
- *         low water mark. If so, pulse the transmitter
- *       if (high_water_mark_reached) {
- *          if (queue->num_queued_packet < low_water_mark) 
- *             high_water_mark_reached = false; * no longer in high water mark state
- *             write(sender_wakeup_eventfd_fd)  * wakeup the transmitter *
- *          endif
+ * 11. If (queue->num_queued_packets == 0) {
+ *     queue_empty = true
+ * 12. else
+ *     queue_mepty= false;
+ *     (Still some items in the queue. So we have to continue dequeueing
+ * 13. endif
+ * 14. pulse_sender = false
+ * 15. if (high_water_mark_reached) {
+ *       if (queue->num_queued_packet < low_water_mark) 
+ *          high_water_mark_reached = false;no longer in high water mark state
+ *          pulse_sender = true;
  *       endif
- * 14. endif
+ * 16. endif
+ * 17. unlock(queue->mutex) 
+ * 18. if (pulse_sender)
+ *       write(sender_wakeup_eventfd_fd);
+ * 19. endif
+ * 20. if (queue_empty) 
+ *       goto step 1 (wait for signal from sender)
+ * 21. else
+ *      goto step 2 (dequeue another batch of packets)
+ * 22. endif
  *
  *
  * How Multiple Receivers works
@@ -235,7 +247,7 @@
  * NOTE: regarding using eventfd with multiple receivers
  *- As it has been tested before, it is possible for multiple processes to wait
  *  on the same eventfd file descriptor using epoll_wait() and have a single
- *  wite() to that eventfd wake up all these pprocess out of epoll_wait()
+ *  write() to that eventfd wake up all these process out of epoll_wait()
  * - But I noticed that When I use eventfd with multiple receivers, I can see
  *   that a pulse gets lost and we fall into a deadlock after ew hundred
  *   thousands to few million objects. Hence I wll NOt use it
@@ -466,7 +478,7 @@ static uint32_t low_water_mark = DEFAULT_QUEUE_LOW_WATER;
 static uint32_t packet_size = DEFAULT_PACKET_SIZE;
 static char queue_name[MAX_QUEUE_NAME_LEN + 1];
 static uint32_t window_size; /* total Number of byte of the shared mem window   */
-static uint32_t batch_size = DEFAULT_BATCH_SIZE; /* # packets for transmitter
+static uint32_t max_batch_size = DEFAULT_BATCH_SIZE; /* # packets for transmitter
                                                  to write or receiver to read
                                                  before stopping to write
                                                  or wait on eventfd,
@@ -837,7 +849,7 @@ print_queue_receiver(shm_queue_t *queue, uint32_t my_receiver_id)
                   num_lost_objs,                                        \
                   num_packets,                                          \
                   num_batchs,                                           \
-                  batch_size,                                           \
+                  max_batch_size,                                       \
                   print_queue(queue));                                  \
     }                                                                   \
   } while (false)
@@ -911,8 +923,8 @@ static void print_stats(void)
              is_adaptive_mutex ? "true" : "false",
              num_receivers,
              num_batchs,
-             batch_size,
-             batch_size * queue->packet_size ,
+             max_batch_size,
+             max_batch_size * queue->packet_size ,
              num_packets,
              queue->packet_size,
              queue->packet_size/queue->obj_size,
@@ -1245,7 +1257,7 @@ print_usage (const char *progname)
            "\t-m <shared memory queue file name>, default '%s'\n"
            "\t-q <queue len>. Default %u packets\n"
            "\t-l <low water mark> Default %u packets\n"
-           "\t-b <batch size>, default %u\n"
+           "\t-b <max_batch size>, default %u\n"
            "\t-i <receiver_ID>. Only needed when more than 1 receiver\n"
            "\t-u Use AF_UNIX socket for singalling instead of default eventfd\n"
            "\t-o <object size>, default %u\n",
@@ -1405,11 +1417,11 @@ main (int    argc,
         strcpy(queue_name, optarg);
         break;
       case 'b':
-        if (1 != sscanf(optarg, "%u", &batch_size)) {
+        if (1 != sscanf(optarg, "%u", &max_batch_size)) {
           PRINT_ERR("\nCannot read batch size %s. \n", optarg);
           exit (EXIT_FAILURE);
         }
-        if (batch_size < 1 || batch_size > MAX_BATCH_SIZE) {
+        if (max_batch_size < 1 || max_batch_size > MAX_BATCH_SIZE) {
           PRINT_ERR("\nInvalid batch_size %s. "
                     "Must be between 1 and %u\n", optarg, MAX_BATCH_SIZE);
           exit (EXIT_FAILURE);
@@ -1483,9 +1495,9 @@ main (int    argc,
     exit (EXIT_FAILURE);
   }
   
-  if (batch_size > queue_len) {
+  if (max_batch_size > queue_len) {
     PRINT_ERR("\nBatch size %u cannot exceed total queue length %u\n",
-              batch_size, queue_len);
+              max_batch_size, queue_len);
     exit (EXIT_FAILURE);
   }
 
@@ -1723,10 +1735,10 @@ main (int    argc,
              queue->packet_size - offsetof(packet_t, data),
              obj_size,
              objs_per_packet,
-             batch_size,
-             batch_size * queue->packet_size,
-             batch_size * objs_per_packet,
-             batch_size * objs_per_packet * queue->obj_size,
+             max_batch_size,
+             max_batch_size * queue->packet_size,
+             max_batch_size * objs_per_packet,
+             max_batch_size * objs_per_packet * queue->obj_size,
              is_transmitter ? "send:   " : "receive:", num_objs,
              window_size,
              window_size - offsetof(shm_queue_t, packets),
@@ -2017,7 +2029,7 @@ main (int    argc,
       is_pulse_receiver = false;
 
       /*Init batch size to what user wants */
-      curr_batch_size = batch_size;
+      curr_batch_size = max_batch_size;
 
       /*
        * If remaining objecets fit into one packet, then reduce batch to 1
@@ -2378,7 +2390,7 @@ main (int    argc,
        * may have already empties the queue. Hence it is OK to have a batch
        * size of zero
        */
-      curr_batch_size = batch_size;
+      curr_batch_size = max_batch_size;
       if (receiver_queue->num_queued_packets < curr_batch_size) {
         curr_batch_size = receiver_queue->num_queued_packets;
       }
