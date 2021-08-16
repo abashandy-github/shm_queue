@@ -35,3 +35,4 @@ How things work
 ===============
 See the comments at the top of each file for explanation of how each
 implementation works
+Also take a look at documents under doc/
