@@ -2,7 +2,7 @@ Introduction
 ============
 
 This repository contains experimental proof-of-concept- code that implements
-few point-to-multipiont  IPC mechanism where there is one sender process and
+few point-to-point and point-to-multipiont IPC mechanisms where there is one sender process and
 one or more receiving processes
 
 Overview
