@@ -335,6 +335,10 @@
 #define COLOR_WIHTE   "\x1B[37m"
 #define COLOR_RESET "\x1B[0m"
 
+/* Blink and bold */
+#define TEXT_BLINK "\x1B[5m"
+#define TEXT_BOLD "\x1B[1m"
+
 
 
 /* Default values for the samred memory queue*/
@@ -451,6 +455,10 @@ static bool is_transmitter = false;
 static uint32_t num_receivers = DEFAULT_NUM_RECEIVERS;
 static int eventfd_flags = EFD_NONBLOCK | EFD_SEMAPHORE;
 
+/*
+ * If true, pause until user presses CTRL^C
+ */
+static bool is_wait_on_ctrl_c = false;
 
 /*
  * IN general, after each batch we will pulse ouirselves if there are still
@@ -576,13 +584,13 @@ struct timeval time_diff;
   } while (false);
 #define PRINT_INFO(str, param...)                                       \
   do {                                                                  \
-    print_debug("%s %d: " str, __FUNCTION__, __LINE__, ##param);        \
+    print_debug(false, false, "%s %d: " str, __FUNCTION__, __LINE__, ##param); \
   } while (false);
 
 #ifdef DEBUG_ENABLE
 #define PRINT_DEBUG(str, param...)                                      \
   do {                                                                  \
-    print_debug("%s %d: " str, __FUNCTION__, __LINE__, ##param);        \
+    print_debug(false, false, "%s %d: " str, __FUNCTION__, __LINE__, ##param); \
   } while (false);
 #else
 #define PRINT_DEBUG(str, param...)
@@ -665,12 +673,20 @@ static void print_error(char *string, ...)
 }
 
 /* Print error in info or debug in normal color */
-__attribute__ ((format (printf, 1, 2), unused))
-static void print_debug(char *string, ...)
+__attribute__ ((format (printf, 3, 4), unused))
+static void print_debug(bool is_blink,
+                        bool is_bold,
+                        char *string, ...)
 {
   va_list args;
   va_start(args, string);
-  fprintf(stdout, COLOR_RESET);
+  if (is_blink) {
+    fprintf(stdout, TEXT_BLINK);
+  } else if (is_bold) {
+    fprintf(stdout, TEXT_BOLD);
+  } else {
+    fprintf(stdout, COLOR_RESET);
+  }
   vfprintf(stdout, string, args);
   va_end(args);
 }
@@ -1004,7 +1020,7 @@ signal_handler(int s __attribute__ ((unused)))
                sock_fd,
                sender_wakeup_eventfd_fd,
                receiver_wakeup_eventfd_fd);
-  
+
   close_fds();
   print_stats();
   exit(EXIT_SUCCESS); 
@@ -1260,6 +1276,7 @@ print_usage (const char *progname)
            "\t-b <max_batch size>, default %u\n"
            "\t-i <receiver_ID>. Only needed when more than 1 receiver\n"
            "\t-u Use AF_UNIX socket for singalling instead of default eventfd\n"
+           "\t-w Pause before exiting until user presses CTRL^C\n"
            "\t-o <object size>, default %u\n",
            progname,
            receiver_defer_after_each_batch ? "true" : "false",
@@ -1302,7 +1319,7 @@ main (int    argc,
   memset(queue_name, 0, sizeof(queue_name));
   strcpy(queue_name, DEFAULT_QUEUE_NAME);
   
-  while ((opt = getopt (argc, argv, "aetdup:r:n:q:b:o:l:S:s:i:")) != -1) {
+  while ((opt = getopt (argc, argv, "aetduwp:r:n:q:b:o:l:S:s:i:")) != -1) {
     switch (opt)
       {
       case 'a':
@@ -1397,6 +1414,11 @@ main (int    argc,
         break;
       case 'e':
         eventfd_flags = EFD_NONBLOCK | EFD_SEMAPHORE;
+        break;
+      case 'w':
+        is_wait_on_ctrl_c = true;
+        print_debug(true, true,
+                   "Receiver timer will NOT BE ACCURATE because '-w' used\n");
         break;
       case 'm':
         if (strlen(optarg) > MAX_QUEUE_NAME_LEN || !strlen(optarg)) {
@@ -2679,6 +2701,24 @@ main (int    argc,
  out:
   print_stats();
 
+  /*
+   * if user requested to freeze until CTRL^C is pressed, then wait on
+   * epoll_wait()
+   */
+  if (is_wait_on_ctrl_c) {
+    print_debug(true, false, "Waiting for user CTRL^C...\n");
+    fprintf(stdout, COLOR_RESET);
+    rc = epoll_wait(epoll_fd, &event, 1, -1);
+    if (rc < 0) {
+      PRINT_ERR("epoll_wait failed while waiting for CTRL^C for epoll_fd %d "
+                "received_evenfd %d"
+                "\tqueue=(%s): %d %s\n",
+                epoll_fd,  receiver_wakeup_eventfd_fd,
+                print_queue(queue), errno, strerror(errno));
+      ret_value = EXIT_FAILURE;
+    }
+  }
+  
   close_fds();
 
    
