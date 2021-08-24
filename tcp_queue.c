@@ -109,16 +109,17 @@
 #define TEXT_BOLD "\x1B[1m"
 
 /* default and max data item size */
-#define DEFAULT_NUM_RECEIVERS (1)
-#define DEFAULT_NUM_OBJS (1 << 20) /* 1M objects to send */
-#define DEFAULT_OBJ_SIZE (sizeof(obj_t) + 30)
-#define DEFAULT_SERVER_PORT (65000)
-#define DEFAULT_NUM_OBJS_PER_BATCH (32)/* # packets to write or read in one shot */
-
 #define MIN_OBJ_SIZE (sizeof(obj_t))
 #define MAX_OBJ_SIZE (1024)
 #define MAX_NUM_OBJS (UINT32_MAX) /* 4 Billion objects to transmit */
 #define MAX_NUM_OBJS_PER_BATCH (8192)/* At most 8k objects in a single write()*/
+#define DEFAULT_NUM_RECEIVERS (1)
+#define DEFAULT_NUM_OBJS (MAX_NUM_OBJS) 
+#define DEFAULT_OBJ_SIZE (sizeof(obj_t) + 30)
+#define DEFAULT_SERVER_PORT (65000)
+#define DEFAULT_NUM_OBJS_PER_BATCH (32)/* # packets to write or read in one shot */
+
+
 /*
  * max and default values for the transmitter-receiver communciation
  */
@@ -545,13 +546,6 @@ main (int    argc,
 
   if (!is_transmitter)  {
     uint32_t counter = 0;
-
-    /* If I am a receiver, I will also set the number of object to max to allow
-     * the sender to control when I exit
-     * REMEMBER, ONLY the last receiver to join will have ACCURATE timing
-     * measurement
-     */
-    num_objs = MAX_NUM_OBJS;
 
     if (connect(sock_fd,
                 (struct sockaddr *)&sockaddr,
