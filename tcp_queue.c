@@ -104,6 +104,9 @@
 #define COLOR_WIHTE   "\x1B[37m"
 #define COLOR_RESET "\x1B[0m"
 
+/* Blink and bold */
+#define TEXT_BLINK "\x1B[5m"
+#define TEXT_BOLD "\x1B[1m"
 
 /* default and max data item size */
 #define DEFAULT_NUM_RECEIVERS (1)
@@ -114,7 +117,7 @@
 
 #define MIN_OBJ_SIZE (sizeof(obj_t))
 #define MAX_OBJ_SIZE (1024)
-#define MAX_NUM_OBJS (1 << 31)     /* 2 Billion objects to transmit */
+#define MAX_NUM_OBJS (UINT32_MAX) /* 4 Billion objects to transmit */
 #define MAX_NUM_OBJS_PER_BATCH (8192)/* At most 8k objects in a single write()*/
 /*
  * max and default values for the transmitter-receiver communciation
@@ -130,6 +133,11 @@ typedef struct obj_t_ {
 } obj_t;
 
 static bool is_transmitter = false;
+
+/*
+ * If true, pause until user presses CTRL^C
+ */
+static bool is_wait_on_ctrl_c = false;
 
 /*
  * objects to bbe sent
@@ -183,16 +191,17 @@ uint32_t num_sent_received_objs = 0; /* Number objects sent/received */
   do {                                                                  \
     print_error("%s %d: " str, __FUNCTION__, __LINE__, ##param);        \
   } while (false);
+
 #define PRINT_INFO(str, param...)                                       \
   do {                                                                  \
-    print_debug("%s %d: " str, __FUNCTION__, __LINE__, ##param);        \
+    print_debug(false, false, "%s %d: " str, __FUNCTION__, __LINE__, ##param); \
   } while (false);
 
 
 #ifdef DEBUGENABLE
 #define PRINT_DEBUG(str, param...)                                      \
   do {                                                                  \
-    print_debug("%s %d: " str, __FUNCTION__, __LINE__, ##param);        \
+    print_debug(false, false, "%s %d: " str, __FUNCTION__, __LINE__, ##param); \
   } while (false);
 #else
 #define PRINT_DEBUG(str, param...)
@@ -206,18 +215,27 @@ static void print_error(char *string, ...)
   va_list args;
   va_start(args, string);
   fprintf(stdout, COLOR_RED);
+  fprintf(stdout, TEXT_BOLD);
   vfprintf(stdout, string, args);
   fprintf(stdout, COLOR_RESET);
   va_end(args);
 }
 
 /* Print error in info or debug in normal color */
-__attribute__ ((format (printf, 1, 2), unused))
-static void print_debug(char *string, ...)
+__attribute__ ((format (printf, 3, 4), unused))
+static void print_debug(bool is_blink,
+                        bool is_bold,
+                        char *string, ...)
 {
   va_list args;
   va_start(args, string);
-  fprintf(stdout, COLOR_RESET);
+  if (is_blink) {
+    fprintf(stdout, TEXT_BLINK);
+  } else if (is_bold) {
+    fprintf(stdout, TEXT_BOLD);
+  } else {
+    fprintf(stdout, COLOR_RESET);
+  }
   vfprintf(stdout, string, args);
   va_end(args);
 }
@@ -257,7 +275,7 @@ signal_handler(int s __attribute__ ((unused)))
 
 
   
-  PRINT_DEBUG( "Going close socket %d\n",
+  PRINT_DEBUG("Going close socket %d\n",
                sock_fd);
   
   close(sock_fd);
@@ -265,6 +283,7 @@ signal_handler(int s __attribute__ ((unused)))
     close(server_accept_fd[i]);
   }
   print_stats("Signal Caught");
+  fprintf(stdout, COLOR_RESET);
   exit(EXIT_SUCCESS); 
 }
 
@@ -277,6 +296,7 @@ print_usage (const char *progname)
            "\t-p <TCP-port>: user another port instead of default'%u'\n" 
            "\t-n <num_objs> # of objects to send/receive. Default %u\n"
            "\t-b <Number of objects to send/receive per batch>, default %u\n"
+           "\t-w Pause before exiting until user presses CTRL^C\n"
            "\t-o <object size>, default %u\n",
            progname,
            DEFAULT_SERVER_PORT,
@@ -296,6 +316,7 @@ main (int    argc,
   socklen_t remote_len;
   uint8_t *packet;
   int ret_val = EXIT_SUCCESS;
+  ssize_t received_size;
 
   /* Setup handler for CTRL^C */
   struct sigaction sigIntHandler;
@@ -309,7 +330,7 @@ main (int    argc,
     goto out;
   }
 
-  while ((opt = getopt (argc, argv, "aetp:r:n:q:b:o:")) != -1) {
+  while ((opt = getopt (argc, argv, "aetwp:r:n:q:b:o:")) != -1) {
     switch (opt)
       {
       case 'n':
@@ -347,6 +368,11 @@ main (int    argc,
                     "Must be between 1 and %u\n", optarg, MAX_NUM_RECEIVERS);
           exit (EXIT_FAILURE);
         }
+        break;
+      case 'w':
+        is_wait_on_ctrl_c = true;
+        print_debug(true, true,
+                   "Receiver timer will NOT BE ACCURATE because '-w' used\n");
         break;
       case 'b':
         if (1 != sscanf(optarg, "%u", &num_objs_per_batch)) {
@@ -468,8 +494,10 @@ main (int    argc,
         exit(EXIT_FAILURE);
       }
 
-      PRINT_INFO("Connected to receiver %d accept_fd %d , len %d.\n",
-                 i, server_accept_fd[i],remote_len);
+      PRINT_INFO("Connected to receiver %d accept_fd %d port %d , len %d.\n",
+                 i, server_accept_fd[i],
+                 ntohs(sockaddr.sin_port),
+                 remote_len);
     }
     PRINT_INFO("Connected to %u receivers..\n\n",num_receivers);
 
@@ -517,6 +545,14 @@ main (int    argc,
 
   if (!is_transmitter)  {
     uint32_t counter = 0;
+
+    /* If I am a receiver, I will also set the number of object to max to allow
+     * the sender to control when I exit
+     * REMEMBER, ONLY the last receiver to join will have ACCURATE timing
+     * measurement
+     */
+    num_objs = MAX_NUM_OBJS;
+
     if (connect(sock_fd,
                 (struct sockaddr *)&sockaddr,
                 remote_len)){
@@ -524,28 +560,20 @@ main (int    argc,
                 sock_fd, remote_len, errno, strerror(errno));
       ret_val = EXIT_FAILURE;
       goto out;
+    } else {
+      PRINT_INFO("Connected to sender sock_fd %d port %d , len %d.\n",
+                 sock_fd,
+                 ntohs(sockaddr.sin_port),
+                 remote_len);
     }
+
 
     /* get time stamp when start receiving */
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
     
     while(num_sent_received_objs < num_objs) {
-      ssize_t j = recv(sock_fd, packet, packet_size, MSG_WAITALL);
-      if (j < 0) {
-        PRINT_ERR("cannot receiver size %d packet_size=%u num_objs_per_batch=%u \n"
-                  "\tnum_sent_received_objs=%u num_packets=%u: %d %s\n", (int32_t)j,
-                  packet_size, num_objs_per_batch,
-                  num_sent_received_objs, num_packets,
-                  errno, strerror(errno));
-        break;
-      }
-      if (j != (ssize_t)packet_size) {
-        PRINT_INFO("Receiver unexpcted size %d packet_size=%u num_objs_per_batch=%u \n"
-                  "\tnum_sent_received_objs=%u num_packets=%u\n", (int32_t)j,
-                  packet_size, num_objs_per_batch,
-                  num_sent_received_objs, num_packets);
-        num_sent_received_objs += j/obj_size;
-        num_packets++;
+      received_size = recv(sock_fd, packet, packet_size, MSG_WAITALL);
+      if (received_size != (ssize_t)packet_size) {
         break;
       } else {
         num_sent_received_objs += num_objs_per_batch;
@@ -568,7 +596,62 @@ main (int    argc,
     }
     /* get time stamp when finish receiving */
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
+
+    /*
+     * check why we got out of the loop
+     */
+    if (received_size != packet_size) {
+      if (received_size == 0) {
+        PRINT_INFO("Peer performed Orderly shutdown.\n"
+                   "\tpacket_size=%u "
+                   "num_objs_per_batch=%u \n"
+                   "\tnum_sent_received_objs=%u num_packets=%u\n",
+                   packet_size, num_objs_per_batch,
+                   num_sent_received_objs, num_packets);
+      } else if (received_size < 0) {
+        if (errno != ECONNRESET &&
+            errno != EINTR) {
+          PRINT_ERR("negative receiver size %d \n "
+                    "\tpacket_size=%u "
+                    "num_objs_per_batch=%u \n"
+                    "\tnum_sent_received_objs=%u num_packets=%u: %d %s\n",
+                    (int32_t)received_size,
+                    packet_size, num_objs_per_batch,
+                    num_sent_received_objs, num_packets,
+                    errno, strerror(errno));
+        } else {
+          if (errno == ECONNRESET) {
+            PRINT_INFO("Connection Reset by peer packet_size=%u "
+                       "num_objs_per_batch=%u \n"
+                       "\tnum_sent_received_objs=%u num_packets=%u\n",
+                       packet_size, num_objs_per_batch,
+                       num_sent_received_objs, num_packets);
+          } else {
+            PRINT_INFO("Signal caugt before data was available\n "
+                       "\tpacket_size=%u "
+                       "num_objs_per_batch=%u \n"
+                       "\tnum_sent_received_objs=%u num_packets=%u\n",
+                       packet_size, num_objs_per_batch,
+                       num_sent_received_objs, num_packets);
+          }
+        }
+      } else {
+        PRINT_INFO("Received unexpected size %d packet_size=%u "
+                   "num_objs_per_batch=%u \n"
+                   "\tnum_sent_received_objs=%u num_packets=%u\n",
+                   (int32_t)received_size,
+                   packet_size, num_objs_per_batch,
+                   num_sent_received_objs, num_packets);
+      }
+      num_sent_received_objs += received_size/obj_size;
+      num_packets++;
+    } else {
+      num_sent_received_objs += num_objs_per_batch;
+      num_packets++;
+    }
   }
+
+
   /*
    * convert timers to timval then use timersub to subtract them
    */
@@ -576,14 +659,22 @@ main (int    argc,
   TIMESPEC_TO_TIMEVAL(&end_tv, &end_ts);
   timersub(&end_tv, &start_tv, &time_diff);
 
+
   
  out:
   print_stats("Exitting");
+
+  if (is_wait_on_ctrl_c) {
+    PRINT_INFO("Waiting for user CTRL^C...\n");
+    sleep(UINT32_MAX);
+  }
 
   close(sock_fd);
   for (i=0; i < num_receivers; i++) {
     close(server_accept_fd[i]);
   }
+
+  fprintf(stdout, COLOR_RESET);
 
   exit(ret_val);
 }
